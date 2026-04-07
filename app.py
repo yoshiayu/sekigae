@@ -23,6 +23,7 @@ from src.repository import (
     bulk_insert_students,
     create_seating_history,
     create_student,
+    delete_all_histories,
     delete_all_students,
     delete_student,
     get_history,
@@ -120,6 +121,21 @@ def _store_result(
     st.session_state["previous_table_map"] = previous_table_map
 
 
+def _clear_current_result_state() -> None:
+    keys = [
+        "current_rows",
+        "current_score",
+        "current_metrics",
+        "current_target_week",
+        "current_settings",
+        "previous_history_id",
+        "previous_pairs",
+        "previous_table_map",
+    ]
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
 def _load_dummy_csv() -> tuple[list[dict[str, str]], list[str]]:
     dummy_path = Path("data/dummy_students_73.csv")
     if not dummy_path.exists():
@@ -157,6 +173,23 @@ with tab_students:
                 bulk_insert_students(parsed_rows)
                 st.success("ダミーデータ73名を登録しました。")
                 st.rerun()
+
+        st.divider()
+        reset_confirm = st.checkbox(
+            "受講生・席替え履歴・画面結果を全リセットしてよい",
+            key="reset_all_confirm",
+        )
+        if st.button(
+            "全リセット実行",
+            key="reset_all_button",
+            type="secondary",
+            disabled=not reset_confirm,
+        ):
+            delete_all_histories()
+            delete_all_students()
+            _clear_current_result_state()
+            st.success("全リセットしました。")
+            st.rerun()
 
     if students:
         df_students = pd.DataFrame(students)
@@ -206,18 +239,26 @@ with tab_students:
             selected = next(
                 row for row in all_students_for_edit if int(row["id"]) == int(selected_id)
             )
-            with st.form("edit_student_form"):
-                edit_name = st.text_input("氏名", value=str(selected["name"]), key="edit_name")
+
+            # 選択IDごとにフォームキーを分けて、対象変更時に値が追従するようにする
+            form_key = f"edit_student_form_{selected_id}"
+            with st.form(form_key):
+                edit_name = st.text_input(
+                    "氏名", value=str(selected["name"]), key=f"edit_name_{selected_id}"
+                )
                 edit_company = st.text_input(
-                    "会社名", value=str(selected["company"]), key="edit_company"
+                    "会社名",
+                    value=str(selected["company"]),
+                    key=f"edit_company_{selected_id}",
                 )
                 edit_skill = st.selectbox(
                     "スキル",
                     options=list(SKILL_LEVELS),
                     index=list(SKILL_LEVELS).index(str(selected["skill_level"])),
-                    key="edit_skill",
+                    key=f"edit_skill_{selected_id}",
                 )
                 edit_submit = st.form_submit_button("更新")
+
             if edit_submit:
                 if not edit_name.strip() or not edit_company.strip():
                     st.error("氏名・会社名は必須です。")
@@ -256,7 +297,10 @@ with tab_students:
                 if replace_all:
                     delete_all_students()
                 inserted = bulk_insert_students(parsed_rows)
+                skipped = len(parsed_rows) - inserted
                 st.success(f"{inserted}件を取り込みました。")
+                if skipped > 0:
+                    st.info(f"{skipped}件は既存データと重複のためスキップしました。")
                 st.rerun()
 
     st.download_button(

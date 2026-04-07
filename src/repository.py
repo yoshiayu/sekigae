@@ -7,6 +7,18 @@ from typing import Any
 from .db import get_connection
 
 
+def _reset_autoincrement(conn: Any, table_names: list[str]) -> None:
+    seq_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+    ).fetchone()
+    if not seq_exists:
+        return
+    conn.executemany(
+        "DELETE FROM sqlite_sequence WHERE name = ?",
+        [(table_name,) for table_name in table_names],
+    )
+
+
 def list_students(search: str = "") -> list[dict[str, Any]]:
     query = """
         SELECT id, name, company, skill_level, created_at, updated_at
@@ -69,13 +81,38 @@ def delete_student(student_id: int) -> None:
 def delete_all_students() -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM students")
+        _reset_autoincrement(conn, ["students"])
+
+
+def delete_all_histories() -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM seating_histories")
+        # seating_histories 削除時に assignments も消えるため両方リセット
+        _reset_autoincrement(conn, ["seating_histories", "seating_assignments"])
 
 
 def bulk_insert_students(rows: list[dict[str, str]]) -> int:
     if not rows:
         return 0
-    values = [(row["name"].strip(), row["company"].strip(), row["skill_level"]) for row in rows]
+
     with get_connection() as conn:
+        existing_rows = conn.execute("SELECT name, company FROM students").fetchall()
+        existing_keys = {(str(row["name"]), str(row["company"])) for row in existing_rows}
+        seen_keys = set(existing_keys)
+
+        values: list[tuple[str, str, str]] = []
+        for row in rows:
+            name = row["name"].strip()
+            company = row["company"].strip()
+            key = (name, company)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            values.append((name, company, row["skill_level"]))
+
+        if not values:
+            return 0
+
         conn.executemany(
             """
             INSERT INTO students (name, company, skill_level, created_at, updated_at)
@@ -221,4 +258,3 @@ def get_previous_context() -> tuple[int | None, set[tuple[int, int]], dict[int, 
                     pair_set.add((b, a))
 
     return history_id, pair_set, student_to_table
-
