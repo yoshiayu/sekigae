@@ -1,0 +1,2 @@
+"""Seating app package."""
+
