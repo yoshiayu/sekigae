@@ -40,6 +40,13 @@ def _pair_key(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a < b else (b, a)
 
 
+def _skill_group(skill_level: str) -> str:
+    # Keep "低い" and "ヤバい" in the same group.
+    if skill_level in ("低い", "ヤバい"):
+        return "low_or_risky"
+    return skill_level
+
+
 def _expected_table_sizes(total_students: int, table_count: int) -> list[int]:
     base = total_students // table_count
     rem = total_students % table_count
@@ -75,14 +82,10 @@ def _evaluate_assignment(
 
     total_students = len(rows)
     expected_sizes = _expected_table_sizes(total_students, config.table_count)
-    avg_skill_targets = {
-        skill: sum(1 for row in rows if row["skill_level"] == skill) / float(config.table_count)
-        for skill in SKILL_LEVELS
-    }
 
     company_collision_total = 0
     previous_pair_hits = 0
-    skill_deviation_total = 0.0
+    skill_mixing_total = 0.0
     size_deviation_total = 0.0
     current_pairs: set[tuple[int, int]] = set()
 
@@ -92,6 +95,7 @@ def _evaluate_assignment(
         members = table_members[table_no]
         company_counter = Counter(m["company"] for m in members)
         skill_counter = Counter(m["skill_level"] for m in members)
+        skill_group_counter = Counter(_skill_group(str(m["skill_level"])) for m in members)
         duplicate_companies = {
             company: count for company, count in company_counter.items() if count > 1
         }
@@ -107,8 +111,12 @@ def _evaluate_assignment(
                 if pair in previous_pairs:
                     previous_pair_hits += 1
 
-        for skill in SKILL_LEVELS:
-            skill_deviation_total += abs(skill_counter.get(skill, 0) - avg_skill_targets[skill])
+        total_pairs = len(members) * (len(members) - 1) // 2
+        same_group_pairs = sum(
+            count * (count - 1) // 2 for count in skill_group_counter.values()
+        )
+        skill_mixing_pairs = total_pairs - same_group_pairs
+        skill_mixing_total += skill_mixing_pairs
 
         target_size = expected_sizes[table_no - 1]
         size_deviation_total += abs(len(members) - target_size)
@@ -118,6 +126,8 @@ def _evaluate_assignment(
                 "table_no": table_no,
                 "size": len(members),
                 "skill_counts": {skill: skill_counter.get(skill, 0) for skill in SKILL_LEVELS},
+                "skill_group_counts": dict(skill_group_counter),
+                "skill_mixing_pairs": int(skill_mixing_pairs),
                 "duplicate_companies": duplicate_companies,
                 "previous_pair_hits": sum(
                     1
@@ -148,14 +158,16 @@ def _evaluate_assignment(
     total_score = (
         company_collision_total * config.company_weight
         + previous_pair_hits * config.previous_weight
-        + skill_deviation_total * config.skill_weight
+        + skill_mixing_total * config.skill_weight
         + size_deviation_total * config.size_weight
     )
 
     metrics = {
         "company_collision_total": company_collision_total,
         "previous_pair_hits": previous_pair_hits,
-        "skill_deviation_total": round(skill_deviation_total, 3),
+        "skill_mixing_total": round(skill_mixing_total, 3),
+        # Keep the old key so existing UI/session data can still read it.
+        "skill_deviation_total": round(skill_mixing_total, 3),
         "size_deviation_total": round(size_deviation_total, 3),
         "overlap_pair_rate": overlap_pair_rate,
         "same_table_student_rate": same_table_rate,
@@ -177,26 +189,28 @@ def _single_attempt(
 
     tables: list[list[Student]] = [[] for _ in range(table_count)]
     table_company_counts: list[defaultdict[str, int]] = [defaultdict(int) for _ in range(table_count)]
-    table_skill_counts: list[defaultdict[str, int]] = [defaultdict(int) for _ in range(table_count)]
+    table_skill_group_counts: list[defaultdict[str, int]] = [defaultdict(int) for _ in range(table_count)]
 
     expected_sizes = _expected_table_sizes(total_students, table_count)
     rng.shuffle(expected_sizes)
 
+    skill_group_counts = Counter(_skill_group(s.skill_level) for s in students)
     skill_counts = Counter(s.skill_level for s in students)
-    skill_targets = {skill: skill_counts.get(skill, 0) / float(table_count) for skill in SKILL_LEVELS}
     company_counts = Counter(s.company for s in students)
 
     order = students[:]
     rng.shuffle(order)
     order.sort(
         key=lambda s: (
-            skill_counts.get(s.skill_level, 0),  # レアなスキルを先に置く
+            skill_group_counts.get(_skill_group(s.skill_level), 0),  # レアなグループを先に置く
+            skill_counts.get(s.skill_level, 0),  # 同グループ内のレア度
             -company_counts.get(s.company, 0),  # 人数が多い会社を先に分散
             rng.random(),
         )
     )
 
     for student in order:
+        student_group = _skill_group(student.skill_level)
         candidates: list[tuple[float, int]] = []
         for table_idx in range(table_count):
             members = tables[table_idx]
@@ -211,10 +225,14 @@ def _single_attempt(
                     prev_hits += 1
             previous_penalty = prev_hits * config.previous_weight
 
-            target_skill = skill_targets[student.skill_level]
-            before_skill = abs(table_skill_counts[table_idx][student.skill_level] - target_skill)
-            after_skill = abs(table_skill_counts[table_idx][student.skill_level] + 1 - target_skill)
-            skill_penalty = (after_skill - before_skill) * config.skill_weight
+            different_group_count = sum(
+                count
+                for group, count in table_skill_group_counts[table_idx].items()
+                if group != student_group
+            )
+            same_group_count = table_skill_group_counts[table_idx][student_group]
+            # Penalize mixing groups, while slightly rewarding denser same-group clusters.
+            skill_penalty = (different_group_count - 0.2 * same_group_count) * config.skill_weight
 
             target_size = expected_sizes[table_idx]
             before_size = abs(len(members) - target_size)
@@ -235,7 +253,7 @@ def _single_attempt(
 
         tables[chosen_table].append(student)
         table_company_counts[chosen_table][student.company] += 1
-        table_skill_counts[chosen_table][student.skill_level] += 1
+        table_skill_group_counts[chosen_table][student_group] += 1
 
     rows = _students_to_rows(tables)
     score, _ = _evaluate_assignment(rows, previous_pairs, previous_table_map={}, config=config)
@@ -261,6 +279,7 @@ def generate_best_assignment(
             "metrics": {
                 "company_collision_total": 0,
                 "previous_pair_hits": 0,
+                "skill_mixing_total": 0.0,
                 "skill_deviation_total": 0.0,
                 "size_deviation_total": 0.0,
                 "overlap_pair_rate": 0.0,

@@ -19,6 +19,10 @@ def _reset_autoincrement(conn: Any, table_names: list[str]) -> None:
     )
 
 
+def _normalize_student_name(value: str) -> str:
+    return " ".join(value.strip().replace("　", " ").split())
+
+
 def list_students(search: str = "") -> list[dict[str, Any]]:
     query = """
         SELECT id, name, company, skill_level, created_at, updated_at
@@ -121,6 +125,46 @@ def bulk_insert_students(rows: list[dict[str, str]]) -> int:
             values,
         )
     return len(values)
+
+
+def bulk_update_student_skills_by_name(
+    name_to_skill: dict[str, str],
+) -> tuple[int, list[str], dict[str, int]]:
+    if not name_to_skill:
+        return 0, [], {}
+
+    with get_connection() as conn:
+        existing_rows = conn.execute("SELECT id, name FROM students").fetchall()
+        index: dict[str, list[int]] = defaultdict(list)
+        for row in existing_rows:
+            normalized = _normalize_student_name(str(row["name"]))
+            index[normalized].append(int(row["id"]))
+
+        update_values: list[tuple[str, int]] = []
+        unmatched_names: list[str] = []
+        matched_name_counts: dict[str, int] = {}
+
+        for raw_name, skill_level in name_to_skill.items():
+            normalized_name = _normalize_student_name(raw_name)
+            matched_ids = index.get(normalized_name, [])
+            if not matched_ids:
+                unmatched_names.append(raw_name)
+                continue
+            matched_name_counts[raw_name] = len(matched_ids)
+            for student_id in matched_ids:
+                update_values.append((skill_level, student_id))
+
+        if update_values:
+            conn.executemany(
+                """
+                UPDATE students
+                SET skill_level = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                update_values,
+            )
+
+    return len(update_values), unmatched_names, matched_name_counts
 
 
 def get_skill_distribution() -> dict[str, int]:

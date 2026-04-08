@@ -21,6 +21,7 @@ from src.csv_service import parse_students_csv, rows_to_assignment_csv, template
 from src.db import init_db
 from src.repository import (
     bulk_insert_students,
+    bulk_update_student_skills_by_name,
     create_seating_history,
     create_student,
     delete_all_histories,
@@ -143,6 +144,111 @@ def _load_dummy_csv() -> tuple[list[dict[str, str]], list[str]]:
     return parse_students_csv(dummy_path.read_bytes())
 
 
+def _normalize_name_text(value: str) -> str:
+    return " ".join(value.strip().replace("　", " ").split())
+
+
+def _normalize_skill_input(value: str) -> str | None:
+    raw = value.strip()
+    if raw in SKILL_LEVELS:
+        return raw
+
+    compact = _normalize_name_text(raw).replace(" ", "").lower()
+    aliases: dict[str, str] = {
+        "高い": "高い",
+        "高": "高い",
+        "high": "高い",
+        "a": "高い",
+        "上級": "高い",
+        "並": "並",
+        "普通": "並",
+        "中": "並",
+        "normal": "並",
+        "b": "並",
+        "標準": "並",
+        "低い": "低い",
+        "低": "低い",
+        "low": "低い",
+        "c": "低い",
+        "初級": "低い",
+        "ヤバい": "ヤバい",
+        "ヤバイ": "ヤバい",
+        "やばい": "ヤバい",
+        "危険": "ヤバい",
+        "d": "ヤバい",
+        "要支援": "ヤバい",
+    }
+    return aliases.get(compact)
+
+
+def _split_name_skill_line(line: str) -> tuple[str, str] | None:
+    if "\t" in line:
+        tab_cells = [cell.strip() for cell in line.split("\t")]
+        non_empty = [cell for cell in tab_cells if cell]
+        if len(non_empty) >= 2:
+            return non_empty[0], non_empty[1]
+
+    for separator in ("=", "＝", ":", "：", ",", "，", "、"):
+        if separator in line:
+            left, right = line.split(separator, 1)
+            return left.strip(), right.strip()
+    return None
+
+
+def _is_skill_header(name_text: str, skill_text: str) -> bool:
+    normalized_name = _normalize_name_text(name_text).replace(" ", "").lower()
+    normalized_skill = _normalize_name_text(skill_text).replace(" ", "").lower()
+    name_candidates = {"受講生", "受講生名", "受講者", "受講者名", "氏名", "名前", "name"}
+    skill_candidates = {
+        "スキル",
+        "スキルレベル",
+        "段階評価",
+        "評価",
+        "レベル",
+        "skill",
+        "skilllevel",
+        "skill_level",
+    }
+    return normalized_name in name_candidates and normalized_skill in skill_candidates
+
+
+def _parse_skill_updates_text(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    rows: list[tuple[str, str]] = []
+    errors: list[str] = []
+
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        split_result = _split_name_skill_line(line)
+        if split_result is None:
+            errors.append(f"{line_no}行目: 区切り文字（タブ / = / : / ,）が見つかりません。")
+            continue
+
+        name_raw, skill_raw = split_result
+        if _is_skill_header(name_raw, skill_raw) and not rows:
+            continue
+
+        name = _normalize_name_text(name_raw)
+        if not name:
+            errors.append(f"{line_no}行目: 受講生名が空です。")
+            continue
+
+        normalized_skill = _normalize_skill_input(skill_raw)
+        if normalized_skill is None:
+            allowed = " / ".join(SKILL_LEVELS)
+            errors.append(f"{line_no}行目: スキルが不正です（{allowed} のみ可）。")
+            continue
+
+        rows.append((name, normalized_skill))
+
+    if not rows and not errors:
+        errors.append("貼り付けデータが空です。")
+
+    return rows, errors
+
+
 st.title("受講生席替えアプリ（MVP）")
 st.caption("毎週運用を想定した、スキル分散 + 会社分散 + 前回同席回避 の自動席替え")
 
@@ -153,6 +259,31 @@ tab_students, tab_run, tab_result, tab_history = st.tabs(
 
 with tab_students:
     st.subheader("受講生一覧")
+    flash = st.session_state.pop("bulk_skill_update_flash", None)
+    if isinstance(flash, dict):
+        requested_names = int(flash.get("requested_names", 0))
+        matched_names = int(flash.get("matched_names", 0))
+        updated_rows = int(flash.get("updated_rows", 0))
+        if updated_rows > 0:
+            st.success(
+                f"{requested_names}件の指定を受け取り、{matched_names}名に一致・"
+                f"{updated_rows}件のスキルを更新しました。"
+            )
+        else:
+            st.warning("一致する受講生が見つからず、更新は0件でした。")
+
+        unmatched_names = [str(name) for name in flash.get("unmatched_names", [])]
+        if unmatched_names:
+            preview = " / ".join(unmatched_names[:10])
+            suffix = " ..." if len(unmatched_names) > 10 else ""
+            st.info(f"未一致の受講生: {preview}{suffix}")
+
+        overwritten_names = [str(name) for name in flash.get("overwritten_names", [])]
+        if overwritten_names:
+            preview = " / ".join(overwritten_names[:10])
+            suffix = " ..." if len(overwritten_names) > 10 else ""
+            st.info(f"同名の複数指定は最後の行を採用: {preview}{suffix}")
+
     search = st.text_input("検索（氏名 / 会社名）", value="", key="student_search")
     students = list_students(search=search)
     all_students = list_students()
@@ -303,6 +434,45 @@ with tab_students:
                     st.info(f"{skipped}件は既存データと重複のためスキップしました。")
                 st.rerun()
 
+    st.divider()
+    st.markdown("#### スキル一括更新（名前は変更しません）")
+    st.caption(
+        "Excelの2列（受講生 / スキル）をそのまま貼り付けできます。"
+        " 区切りはタブ・`=`・`:`・`,` に対応。"
+    )
+    bulk_skill_text = st.text_area(
+        "貼り付けデータ",
+        key="bulk_skill_text",
+        height=180,
+        placeholder="受講生\tスキル\n山田 太郎\t高い\n佐藤 花子\t並",
+    )
+    if st.button("スキル一括更新を実行", key="bulk_update_skill_button"):
+        parsed_updates, parse_errors = _parse_skill_updates_text(bulk_skill_text)
+        if parse_errors:
+            st.error("一括更新データに不備があります。")
+            for err in parse_errors:
+                st.write(f"- {err}")
+        else:
+            name_to_skill: dict[str, str] = {}
+            overwritten_names: list[str] = []
+            for name, skill_level in parsed_updates:
+                previous_skill = name_to_skill.get(name)
+                if previous_skill is not None and previous_skill != skill_level:
+                    overwritten_names.append(name)
+                name_to_skill[name] = skill_level
+
+            updated_rows, unmatched_names, matched_name_counts = bulk_update_student_skills_by_name(
+                name_to_skill
+            )
+            st.session_state["bulk_skill_update_flash"] = {
+                "requested_names": len(name_to_skill),
+                "matched_names": len(matched_name_counts),
+                "updated_rows": updated_rows,
+                "unmatched_names": unmatched_names,
+                "overwritten_names": list(dict.fromkeys(overwritten_names)),
+            }
+            st.rerun()
+
     st.download_button(
         label="CSVテンプレートをダウンロード",
         data=template_csv_text().encode("utf-8-sig"),
@@ -343,7 +513,11 @@ with tab_run:
         )
     with col_w2:
         skill_weight = st.slider(
-            "スキル分散の強さ", 1.0, 60.0, float(DEFAULT_WEIGHTS["skill"]), 1.0
+            "スキル固めの強さ（低い/ヤバい同グループ）",
+            1.0,
+            60.0,
+            float(DEFAULT_WEIGHTS["skill"]),
+            1.0,
         )
         size_weight = st.slider("人数均等化の強さ", 0.0, 10.0, float(DEFAULT_WEIGHTS["size"]), 0.5)
     with col_w3:
@@ -469,29 +643,30 @@ with tab_result:
             metric = table_metrics.get(table_no, {})
 
             with col:
-                st.markdown(f"##### Table {table_no} ({len(members)}名)")
-                if not members:
-                    st.caption("未配置")
-                for member in members:
-                    badge = _skill_badge(str(member["skill_level"]))
-                    st.markdown(
-                        (
-                            f"<div style='padding:6px 8px;border:1px solid #E2E8F0;"
-                            f"border-radius:8px;margin-bottom:6px;'>"
-                            f"<strong>{member['name']}</strong><br>"
-                            f"{member['company']}<br>{badge}</div>"
-                        ),
-                        unsafe_allow_html=True,
-                    )
+                with st.container(border=True):
+                    st.markdown(f"##### Table {table_no} ({len(members)}名)")
+                    if not members:
+                        st.caption("未配置")
+                    for member in members:
+                        badge = _skill_badge(str(member["skill_level"]))
+                        st.markdown(
+                            (
+                                f"<div style='padding:6px 8px;border:1px solid #E2E8F0;"
+                                f"border-radius:8px;margin-bottom:6px;'>"
+                                f"<strong>{member['name']}</strong><br>"
+                                f"{member['company']}<br>{badge}</div>"
+                            ),
+                            unsafe_allow_html=True,
+                        )
 
-                duplicate_companies = metric.get("duplicate_companies", {})
-                if duplicate_companies:
-                    info = ", ".join(f"{k}({v})" for k, v in duplicate_companies.items())
-                    st.warning(f"会社重複: {info}")
+                    duplicate_companies = metric.get("duplicate_companies", {})
+                    if duplicate_companies:
+                        info = ", ".join(f"{k}({v})" for k, v in duplicate_companies.items())
+                        st.warning(f"会社重複: {info}")
 
-                prev_hits = int(metric.get("previous_pair_hits", 0))
-                if prev_hits > 0:
-                    st.caption(f"前回同席ペア重複: {prev_hits}")
+                    prev_hits = int(metric.get("previous_pair_hits", 0))
+                    if prev_hits > 0:
+                        st.caption(f"前回同席ペア重複: {prev_hits}")
 
         csv_bytes = rows_to_assignment_csv(
             rows=current_rows,
@@ -574,9 +749,10 @@ with tab_history:
                 col = cols[(table_no - 1) % 3]
                 members = table_map[table_no]
                 with col:
-                    st.markdown(f"##### Table {table_no} ({len(members)}名)")
-                    for member in members:
-                        st.write(f"- {member['name']} / {member['company']} / {member['skill_level']}")
+                    with st.container(border=True):
+                        st.markdown(f"##### Table {table_no} ({len(members)}名)")
+                        for member in members:
+                            st.write(f"- {member['name']} / {member['company']} / {member['skill_level']}")
 
             history_csv = rows_to_assignment_csv(
                 rows=history_rows,

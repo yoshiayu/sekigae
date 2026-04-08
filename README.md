@@ -1,9 +1,9 @@
-# 受講生席替えアプリ (Streamlit + SQLite)
+﻿# 受講生席替えアプリ (Streamlit + SQLite)
 
 毎週の席替え運用を想定したMVPです。  
 73名を13テーブル(最大6名/テーブル)に対して、以下を考慮しながら自動割当します。
 
-- スキル分散（高い / 並 / 低い / ヤバい）
+- スキル固め（`高い` / `並` / `低い+ヤバい` の3グループ）
 - 同じ会社の偏り回避
 - 前回同席ペアの再同席回避
 - 収容制約（必ず全員配置、上限超過なし）
@@ -14,6 +14,12 @@
 - ロジック: Python
 - DB: SQLite (`seating_app.db`)
 - データ表示: pandas
+
+## 動作環境
+
+- Python 3.11 以上推奨（3.13で動作確認）
+- `pip` が使えること
+- ブラウザで `http://127.0.0.1:8501` にアクセスできること
 
 ## ディレクトリ構成
 
@@ -26,8 +32,13 @@
 ├─ data
 │  ├─ sample_students.csv
 │  └─ dummy_students_73.csv
+├─ logs
+│  ├─ streamlit.out.log         # バックグラウンド起動時に作成
+│  └─ streamlit.err.log         # バックグラウンド起動時に作成
 ├─ scripts
-│  └─ smoke_test.py
+│  ├─ smoke_test.py
+│  ├─ run_streamlit_background.ps1
+│  └─ install_startup_task.ps1
 └─ src
    ├─ __init__.py
    ├─ constants.py
@@ -39,75 +50,66 @@
 
 ## セットアップ
 
-```bash
+Windows (PowerShell):
+
+```powershell
 python -m venv .venv
-# Windows PowerShell
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+macOS / Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 ## 実行手順
 
+どのPCでもコマンド差分を減らすため、`python -m streamlit` で実行します。
+
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
-ブラウザで表示されたURLを開いて利用します。
+ポート変更したい場合:
+
+```bash
+python -m streamlit run app.py --server.port 8502
+```
+
+## Windowsでバックグラウンド常駐起動
+
+以下を1回実行すると、ログオン時に自動起動するよう設定します。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_startup_task.ps1
+```
+
+補足:
+
+- 可能なら Scheduled Task を作成します
+- 権限不足で失敗した場合は Startup フォルダ方式に自動フォールバックします
+- ログは `logs/streamlit.out.log` と `logs/streamlit.err.log` に出力されます
+
+手動でバックグラウンド起動する場合:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_streamlit_background.ps1
+```
 
 ## 主な機能
 
-- 受講生管理
-- 追加 / 編集 / 削除
-- 検索
+- 受講生管理（追加 / 編集 / 削除 / 検索）
 - CSVインポート（追記 or 全置換）
-- CSVテンプレートダウンロード
+- スキル一括更新（名前は変更せず、スキルのみ更新）
 - ダミー73名データ投入
-
-- 席替え実行
-- 条件重み設定（同じ会社回避・前回同席回避・スキル分散・人数均等化）
-- 試行回数指定（100〜500）
-- 乱数シード指定（任意）
-
-- 結果画面
-- テーブル1〜13を表示
-- スキル色分け表示
-- 会社重複警告 / 前回ペア重複表示
-- CSV出力
+- 席替え実行（重み設定、試行回数、乱数シード）
+- テーブル表示（テーブルごとの枠表示）
 - 手動調整（`table_no` 直接編集）
-- 履歴保存
-
-- 履歴管理
-- 週ごとの結果一覧
-- 履歴詳細表示
-- 履歴CSV出力
-- 過去履歴の結果タブ再読み込み
-
-## データ構造
-
-### Student (`students`)
-
-- id
-- name
-- company
-- skill_level
-- created_at
-- updated_at
-
-### SeatingHistory (`seating_histories`)
-
-- id
-- target_week
-- settings_json
-- total_score
-- overlap_rate
-- created_at
-
-### SeatingAssignment (`seating_assignments`)
-
-- id
-- seating_history_id
-- table_no
-- student_id
+- CSV出力 / 履歴保存 / 履歴再読み込み
 
 ## CSV仕様
 
@@ -126,40 +128,25 @@ name,company,skill_level
 
 不正時は行番号付きでエラー表示します。
 
-## 席替えアルゴリズム
+## スキル一括更新の貼り付け形式
 
-`src/seating.py` の `generate_best_assignment` を使用。
+以下のいずれかで貼り付け可能です。
 
-1. 初期化
-- 受講生をスキル人数・会社人数情報付きで並べ替え（レアスキル優先、人数多い会社優先）
-- テーブル期待人数（73名なら6名×8卓、5名×5卓）を計算
+- `受講生<TAB>スキル`（Excelの2列コピペ）
+- `受講生=スキル`
+- `受講生:スキル`
+- `受講生,スキル`
 
-2. 1回の割当試行
-- 各受講生について、全テーブル候補のスコアを計算
-- スコア項目:
-- 同じ会社が既にいる人数（大ペナルティ）
-- 前回同席ペア人数（中ペナルティ）
-- スキル偏り悪化度（大ペナルティ）
-- 期待人数からのずれ（小ペナルティ）
-- ランダム揺らぎ（低優先）
-- 上位候補から確率的に選択して配置
+## 席替えアルゴリズム概要
 
-3. 複数回試行
-- 100〜500回試行
-- 総合スコア最小案を採用
+`src/seating.py` の `generate_best_assignment` を使用します。
 
-4. 評価
-- 会社重複数
-- 前回同席ペア重複数 / 重複率
-- スキル偏差
-- テーブル人数偏差
+- 同じ会社の重複
+- 前回同席ペアの再発
+- スキルグループ混在ペア（混ざるほどペナルティ）
+- テーブル人数の偏差
 
-## エラー時の挙動
-
-- 上限超過（13×6を超える）は実行不可
-- CSV不正は行番号付きで表示
-- 手動調整で6名超過や範囲外テーブル指定があれば反映拒否
-- 席替え生成失敗時は例外メッセージを表示
+をスコア化し、複数回試行で最小スコア案を採用します。
 
 ## スモークテスト
 
@@ -174,12 +161,10 @@ smoke test passed
 score=...
 ```
 
-## 今後の改善案
+## トラブルシュート
 
-- ドラッグ&ドロップUIの追加（現状はtable_no編集方式）
-- 男女/年齢/コース分散を重み付き制約として追加
-- 履歴を使った複数週連続の重複最小化
-- 手動調整の操作履歴（Undo/Redo）
-- 権限管理（教務/講師）
-- PostgreSQL対応
-
+- `streamlit` が見つからない:
+  - `python -m pip install -r requirements.txt`
+  - 実行は `python -m streamlit run app.py` を使用
+- `Port 8501 is not available`:
+  - 既存プロセスを停止するか、`--server.port` で別ポートを使用
