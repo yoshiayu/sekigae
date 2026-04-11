@@ -12,14 +12,14 @@ SKILL_COLORS = {
 CSV_COLUMNS = ("name", "company", "skill_level")
 
 DEFAULT_TABLE_COUNT = 13
+DEFAULT_MIN_PER_TABLE = 5
 DEFAULT_MAX_PER_TABLE = 6
 DEFAULT_ATTEMPTS = 300
 
 DEFAULT_WEIGHTS = {
     "company": 26.0,
     "previous": 14.0,
-    "skill": 24.0,
+    "skill": 32.0,
     "size": 2.0,
     "randomness": 1.0,
 }
-

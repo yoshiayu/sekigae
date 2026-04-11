@@ -9,10 +9,13 @@ from typing import Any
 from .constants import (
     DEFAULT_ATTEMPTS,
     DEFAULT_MAX_PER_TABLE,
+    DEFAULT_MIN_PER_TABLE,
     DEFAULT_TABLE_COUNT,
     DEFAULT_WEIGHTS,
     SKILL_LEVELS,
 )
+
+_SKILL_PRIORITY = {skill: idx for idx, skill in enumerate(SKILL_LEVELS)}
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,7 @@ class Student:
 @dataclass(frozen=True)
 class SeatingConfig:
     table_count: int = DEFAULT_TABLE_COUNT
+    min_per_table: int = DEFAULT_MIN_PER_TABLE
     max_per_table: int = DEFAULT_MAX_PER_TABLE
     attempts: int = DEFAULT_ATTEMPTS
     company_weight: float = DEFAULT_WEIGHTS["company"]
@@ -41,16 +45,151 @@ def _pair_key(a: int, b: int) -> tuple[int, int]:
 
 
 def _skill_group(skill_level: str) -> str:
-    # Keep "低い" and "ヤバい" in the same group.
-    if skill_level in ("低い", "ヤバい"):
-        return "low_or_risky"
+    # Skill grouping now uses exact levels because seating constraints
+    # depend on adjacent skill distance.
     return skill_level
 
 
-def _expected_table_sizes(total_students: int, table_count: int) -> list[int]:
-    base = total_students // table_count
-    rem = total_students % table_count
-    return [base + 1 if i < rem else base for i in range(table_count)]
+def _is_forbidden_skill_pair(skill_a: str, skill_b: str) -> bool:
+    # Hard constraints:
+    # - 高い×低い は禁止
+    # - 高い×ヤバい は禁止
+    pair = frozenset((skill_a, skill_b))
+    return pair in {frozenset(("高い", "低い")), frozenset(("高い", "ヤバい"))}
+
+
+def _bounded_balanced_table_sizes(
+    total_students: int, table_count: int, min_per_table: int, max_per_table: int
+) -> list[int] | None:
+    if table_count <= 0 or min_per_table < 0 or max_per_table < min_per_table:
+        return None
+
+    min_total = table_count * min_per_table
+    max_total = table_count * max_per_table
+    if total_students < min_total or total_students > max_total:
+        return None
+
+    sizes = [min_per_table for _ in range(table_count)]
+    remaining = total_students - min_total
+    idx = 0
+    while remaining > 0:
+        if sizes[idx] < max_per_table:
+            sizes[idx] += 1
+            remaining -= 1
+        idx = (idx + 1) % table_count
+    return sizes
+
+
+def _can_share_table(skill_a: str, skill_b: str) -> bool:
+    return not _is_forbidden_skill_pair(skill_a, skill_b)
+
+
+def _members_accept_skill(members: list[Student], skill_level: str) -> bool:
+    return all(_can_share_table(skill_level, member.skill_level) for member in members)
+
+
+def _members_accept_skill_with_extra(
+    members: list[Student], extra_skill_level: str, skill_level: str
+) -> bool:
+    if not _can_share_table(skill_level, extra_skill_level):
+        return False
+    return _members_accept_skill(members, skill_level)
+
+
+def _has_future_capacity_after_placement(
+    *,
+    tables: list[list[Student]],
+    target_sizes: list[int],
+    remaining_skill_counts: Counter[str],
+    place_table_idx: int,
+    place_student_skill: str,
+) -> bool:
+    # Simulate consuming current student.
+    rest_counts = Counter(remaining_skill_counts)
+    rest_counts[place_student_skill] -= 1
+    if rest_counts[place_student_skill] <= 0:
+        rest_counts.pop(place_student_skill, None)
+
+    for skill_level, need_count in rest_counts.items():
+        if need_count <= 0:
+            continue
+
+        available_slots = 0
+        for table_idx, members in enumerate(tables):
+            current_size = len(members)
+            if table_idx == place_table_idx:
+                current_size += 1
+                if current_size >= target_sizes[table_idx]:
+                    continue
+                if _members_accept_skill_with_extra(members, place_student_skill, skill_level):
+                    available_slots += target_sizes[table_idx] - current_size
+            else:
+                if current_size >= target_sizes[table_idx]:
+                    continue
+                if _members_accept_skill(members, skill_level):
+                    available_slots += target_sizes[table_idx] - current_size
+
+        if need_count > available_slots:
+            return False
+
+    return True
+
+
+def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: random.Random) -> list[dict[str, Any]]:
+    target_sizes = _bounded_balanced_table_sizes(
+        total_students=len(students),
+        table_count=config.table_count,
+        min_per_table=config.min_per_table,
+        max_per_table=config.max_per_table,
+    )
+    if target_sizes is None:
+        raise ValueError(
+            "人数制約を満たせません。テーブル数・最小人数・最大人数を見直してください。"
+        )
+
+    # Hard-skill-constraint fallback:
+    # keep forbidden pairs out while trying to fill all seats.
+    tables: list[list[Student]] = [[] for _ in range(config.table_count)]
+    remaining = students[:]
+    rng.shuffle(remaining)
+
+    while remaining:
+        # Most-constrained-first: choose student with fewest compatible tables.
+        best_idx: int | None = None
+        best_candidates: list[int] = []
+
+        for idx, student in enumerate(remaining):
+            candidate_tables: list[int] = []
+            for table_idx, members in enumerate(tables):
+                if len(members) >= target_sizes[table_idx]:
+                    continue
+                if any(_is_forbidden_skill_pair(student.skill_level, m.skill_level) for m in members):
+                    continue
+                candidate_tables.append(table_idx)
+
+            if best_idx is None or len(candidate_tables) < len(best_candidates):
+                best_idx = idx
+                best_candidates = candidate_tables
+                if len(best_candidates) == 0:
+                    break
+
+        if best_idx is None or not best_candidates:
+            raise ValueError(
+                "スキル同席制約のため配席できません。テーブル数や min/max 設定を見直してください。"
+            )
+
+        student = remaining.pop(best_idx)
+        # Prefer tables with larger remaining capacity, then less size deviation.
+        best_candidates.sort(
+            key=lambda t: (
+                -(target_sizes[t] - len(tables[t])),
+                abs((len(tables[t]) + 1) - target_sizes[t]),
+                rng.random(),
+            )
+        )
+        chosen_table = best_candidates[0]
+        tables[chosen_table].append(student)
+    return _students_to_rows(tables)
 
 
 def _students_to_rows(tables: list[list[Student]]) -> list[dict[str, Any]]:
@@ -70,6 +209,52 @@ def _students_to_rows(tables: list[list[Student]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _dominant_table_skill(members: list[dict[str, Any]]) -> str:
+    if not members:
+        return ""
+    counts = Counter(str(m.get("skill_level", "")).strip() for m in members)
+    ranked = sorted(
+        counts.items(),
+        key=lambda item: (-item[1], _SKILL_PRIORITY.get(item[0], len(_SKILL_PRIORITY)), item[0]),
+    )
+    return ranked[0][0] if ranked else ""
+
+
+def _renumber_tables_by_skill_priority(
+    rows: list[dict[str, Any]], table_count: int
+) -> list[dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {table_no: [] for table_no in range(1, table_count + 1)}
+    for row in rows:
+        table_no = int(row["table_no"])
+        if table_no in grouped:
+            grouped[table_no].append(row)
+
+    source_table_order = sorted(
+        grouped.keys(),
+        key=lambda table_no: (
+            _SKILL_PRIORITY.get(
+                _dominant_table_skill(grouped[table_no]),
+                len(_SKILL_PRIORITY),
+            ),
+            table_no,
+        ),
+    )
+
+    remap: dict[int, int] = {
+        old_table_no: new_table_no for new_table_no, old_table_no in enumerate(source_table_order, start=1)
+    }
+
+    renumbered: list[dict[str, Any]] = []
+    for row in rows:
+        old_table_no = int(row["table_no"])
+        new_row = dict(row)
+        new_row["table_no"] = remap.get(old_table_no, old_table_no)
+        renumbered.append(new_row)
+
+    renumbered.sort(key=lambda r: (int(r["table_no"]), int(r["student_id"])))
+    return renumbered
+
+
 def _evaluate_assignment(
     rows: list[dict[str, Any]],
     previous_pairs: set[tuple[int, int]],
@@ -81,11 +266,20 @@ def _evaluate_assignment(
         table_members[int(row["table_no"])].append(row)
 
     total_students = len(rows)
-    expected_sizes = _expected_table_sizes(total_students, config.table_count)
+    expected_sizes = _bounded_balanced_table_sizes(
+        total_students=total_students,
+        table_count=config.table_count,
+        min_per_table=config.min_per_table,
+        max_per_table=config.max_per_table,
+    )
+    if expected_sizes is None:
+        expected_sizes = [0 for _ in range(config.table_count)]
 
     company_collision_total = 0
     previous_pair_hits = 0
     skill_mixing_total = 0.0
+    exact_skill_mixing_total = 0.0
+    forbidden_skill_pair_total = 0
     size_deviation_total = 0.0
     current_pairs: set[tuple[int, int]] = set()
 
@@ -104,19 +298,26 @@ def _evaluate_assignment(
 
         for i in range(len(members)):
             sid_i = int(members[i]["student_id"])
+            skill_i = str(members[i]["skill_level"])
             for j in range(i + 1, len(members)):
                 sid_j = int(members[j]["student_id"])
+                skill_j = str(members[j]["skill_level"])
                 pair = _pair_key(sid_i, sid_j)
                 current_pairs.add(pair)
                 if pair in previous_pairs:
                     previous_pair_hits += 1
+                if _is_forbidden_skill_pair(skill_i, skill_j):
+                    forbidden_skill_pair_total += 1
 
         total_pairs = len(members) * (len(members) - 1) // 2
         same_group_pairs = sum(
             count * (count - 1) // 2 for count in skill_group_counter.values()
         )
         skill_mixing_pairs = total_pairs - same_group_pairs
+        same_skill_pairs = sum(count * (count - 1) // 2 for count in skill_counter.values())
+        exact_skill_mixing_pairs = total_pairs - same_skill_pairs
         skill_mixing_total += skill_mixing_pairs
+        exact_skill_mixing_total += exact_skill_mixing_pairs
 
         target_size = expected_sizes[table_no - 1]
         size_deviation_total += abs(len(members) - target_size)
@@ -128,6 +329,7 @@ def _evaluate_assignment(
                 "skill_counts": {skill: skill_counter.get(skill, 0) for skill in SKILL_LEVELS},
                 "skill_group_counts": dict(skill_group_counter),
                 "skill_mixing_pairs": int(skill_mixing_pairs),
+                "exact_skill_mixing_pairs": int(exact_skill_mixing_pairs),
                 "duplicate_companies": duplicate_companies,
                 "previous_pair_hits": sum(
                     1
@@ -158,14 +360,17 @@ def _evaluate_assignment(
     total_score = (
         company_collision_total * config.company_weight
         + previous_pair_hits * config.previous_weight
-        + skill_mixing_total * config.skill_weight
+        + (skill_mixing_total + 0.8 * exact_skill_mixing_total) * config.skill_weight
         + size_deviation_total * config.size_weight
+        + forbidden_skill_pair_total * config.skill_weight * 1000.0
     )
 
     metrics = {
         "company_collision_total": company_collision_total,
         "previous_pair_hits": previous_pair_hits,
         "skill_mixing_total": round(skill_mixing_total, 3),
+        "exact_skill_mixing_total": round(exact_skill_mixing_total, 3),
+        "forbidden_skill_pair_total": forbidden_skill_pair_total,
         # Keep the old key so existing UI/session data can still read it.
         "skill_deviation_total": round(skill_mixing_total, 3),
         "size_deviation_total": round(size_deviation_total, 3),
@@ -182,6 +387,7 @@ def _single_attempt(
     previous_pairs: set[tuple[int, int]],
     config: SeatingConfig,
     rng: random.Random,
+    enforce_future_feasibility: bool,
 ) -> tuple[list[dict[str, Any]], float]:
     table_count = config.table_count
     max_per_table = config.max_per_table
@@ -190,9 +396,18 @@ def _single_attempt(
     tables: list[list[Student]] = [[] for _ in range(table_count)]
     table_company_counts: list[defaultdict[str, int]] = [defaultdict(int) for _ in range(table_count)]
     table_skill_group_counts: list[defaultdict[str, int]] = [defaultdict(int) for _ in range(table_count)]
+    table_skill_level_counts: list[defaultdict[str, int]] = [
+        defaultdict(int) for _ in range(table_count)
+    ]
 
-    expected_sizes = _expected_table_sizes(total_students, table_count)
-    rng.shuffle(expected_sizes)
+    target_sizes = _bounded_balanced_table_sizes(
+        total_students=total_students,
+        table_count=table_count,
+        min_per_table=config.min_per_table,
+        max_per_table=max_per_table,
+    )
+    if target_sizes is None:
+        return [], math.inf
 
     skill_group_counts = Counter(_skill_group(s.skill_level) for s in students)
     skill_counts = Counter(s.skill_level for s in students)
@@ -208,14 +423,34 @@ def _single_attempt(
             rng.random(),
         )
     )
+    remaining_skill_counts = Counter(s.skill_level for s in order)
 
     for student in order:
         student_group = _skill_group(student.skill_level)
         candidates: list[tuple[float, int]] = []
         for table_idx in range(table_count):
             members = tables[table_idx]
-            if len(members) >= max_per_table:
+            if len(members) >= target_sizes[table_idx]:
                 continue
+
+            forbidden_with_members = sum(
+                1
+                for other in members
+                if _is_forbidden_skill_pair(student.skill_level, other.skill_level)
+            )
+            if forbidden_with_members > 0:
+                # Hard constraint: forbidden pairs cannot share a table.
+                continue
+
+            if enforce_future_feasibility:
+                if not _has_future_capacity_after_placement(
+                    tables=tables,
+                    target_sizes=target_sizes,
+                    remaining_skill_counts=remaining_skill_counts,
+                    place_table_idx=table_idx,
+                    place_student_skill=student.skill_level,
+                ):
+                    continue
 
             company_penalty = table_company_counts[table_idx][student.company] * config.company_weight
 
@@ -231,10 +466,17 @@ def _single_attempt(
                 if group != student_group
             )
             same_group_count = table_skill_group_counts[table_idx][student_group]
-            # Penalize mixing groups, while slightly rewarding denser same-group clusters.
-            skill_penalty = (different_group_count - 0.2 * same_group_count) * config.skill_weight
-
-            target_size = expected_sizes[table_idx]
+            same_skill_count = table_skill_level_counts[table_idx][student.skill_level]
+            adjacent_skill_count = max(0, len(members) - same_skill_count)
+            # Same-skill is preferred; adjacent mixing is fallback when filling seats.
+            skill_penalty = (
+                2.4 * adjacent_skill_count
+                - 0.9 * same_skill_count
+                - 0.4 * same_group_count
+            ) * config.skill_weight
+            if adjacent_skill_count > 0:
+                skill_penalty += (adjacent_skill_count**2) * 0.25 * config.skill_weight
+            target_size = target_sizes[table_idx]
             before_size = abs(len(members) - target_size)
             after_size = abs(len(members) + 1 - target_size)
             size_penalty = (after_size - before_size) * config.size_weight
@@ -254,6 +496,10 @@ def _single_attempt(
         tables[chosen_table].append(student)
         table_company_counts[chosen_table][student.company] += 1
         table_skill_group_counts[chosen_table][student_group] += 1
+        table_skill_level_counts[chosen_table][student.skill_level] += 1
+        remaining_skill_counts[student.skill_level] -= 1
+        if remaining_skill_counts[student.skill_level] <= 0:
+            remaining_skill_counts.pop(student.skill_level, None)
 
     rows = _students_to_rows(tables)
     score, _ = _evaluate_assignment(rows, previous_pairs, previous_table_map={}, config=config)
@@ -266,7 +512,18 @@ def generate_best_assignment(
     previous_table_map: dict[int, int],
     config: SeatingConfig,
 ) -> dict[str, Any]:
+    if config.min_per_table > config.max_per_table:
+        raise ValueError(
+            f"最小人数と最大人数の設定が不正です。min={config.min_per_table}, max={config.max_per_table}"
+        )
+
+    min_required = config.table_count * config.min_per_table
     capacity = config.table_count * config.max_per_table
+    if len(students) < min_required:
+        raise ValueError(
+            "受講生数が最小必要人数を下回っています。"
+            f" students={len(students)}, min_required={min_required}"
+        )
     if len(students) > capacity:
         raise ValueError(
             f"受講生数が上限を超えています。students={len(students)}, capacity={capacity}"
@@ -281,6 +538,7 @@ def generate_best_assignment(
                 "previous_pair_hits": 0,
                 "skill_mixing_total": 0.0,
                 "skill_deviation_total": 0.0,
+                "forbidden_skill_pair_total": 0,
                 "size_deviation_total": 0.0,
                 "overlap_pair_rate": 0.0,
                 "same_table_student_rate": 0.0,
@@ -292,36 +550,94 @@ def generate_best_assignment(
     base_rng = random.Random(config.seed)
     best_rows: list[dict[str, Any]] = []
     best_score = math.inf
+    used_mode = "strict"
 
-    for _ in range(max(1, config.attempts)):
-        attempt_rng = random.Random(base_rng.randint(1, 10**9))
-        rows, rough_score = _single_attempt(students, previous_pairs, config, attempt_rng)
-        if not rows:
-            continue
-        if rough_score < best_score:
-            best_rows = rows
-            best_score = rough_score
+    search_modes: list[tuple[str, bool, int]] = [
+        ("strict", True, max(1, config.attempts)),
+        ("strict_relaxed", False, max(1, config.attempts)),
+    ]
+
+    for mode_name, enforce_future_feasibility, attempts in search_modes:
+        mode_best_rows: list[dict[str, Any]] = []
+        mode_best_score = math.inf
+        for _ in range(attempts):
+            attempt_rng = random.Random(base_rng.randint(1, 10**9))
+            rows, rough_score = _single_attempt(
+                students=students,
+                previous_pairs=previous_pairs,
+                config=config,
+                rng=attempt_rng,
+                enforce_future_feasibility=enforce_future_feasibility,
+            )
+            if not rows:
+                continue
+            if rough_score < mode_best_score:
+                mode_best_rows = rows
+                mode_best_score = rough_score
+        if mode_best_rows:
+            best_rows = mode_best_rows
+            best_score = mode_best_score
+            used_mode = mode_name
+            break
 
     if not best_rows:
-        raise RuntimeError("席替え計算に失敗しました。設定を見直してください。")
+        # Hard-constraint fallback: still disallow forbidden skill pairs.
+        best_rows = _capacity_fill_rows(students, config, random.Random(base_rng.randint(1, 10**9)))
+        used_mode = "hard_constraint_fallback"
 
+    best_rows = _renumber_tables_by_skill_priority(best_rows, config.table_count)
     final_score, metrics = _evaluate_assignment(best_rows, previous_pairs, previous_table_map, config)
+    metrics["assignment_mode"] = used_mode
+    metrics["fallback_used"] = used_mode != "strict"
     return {"rows": best_rows, "score": final_score, "metrics": metrics}
 
 
 def validate_manual_rows(
-    rows: list[dict[str, Any]], table_count: int, max_per_table: int
+    rows: list[dict[str, Any]], table_count: int, min_per_table: int, max_per_table: int
 ) -> list[str]:
     errors: list[str] = []
     if any(int(row["table_no"]) < 1 or int(row["table_no"]) > table_count for row in rows):
         errors.append(f"table_no は 1〜{table_count} の範囲で入力してください。")
 
     table_sizes = Counter(int(row["table_no"]) for row in rows)
+    under_min = [table_no for table_no in range(1, table_count + 1) if table_sizes.get(table_no, 0) < min_per_table]
+    if under_min:
+        under_min_str = ", ".join(str(no) for no in under_min)
+        errors.append(
+            f"テーブル下限({min_per_table}名)を下回っているテーブルがあります: {under_min_str}"
+        )
+
     over_capacity = [table_no for table_no, size in table_sizes.items() if size > max_per_table]
     if over_capacity:
         over_capacity_str = ", ".join(str(no) for no in sorted(over_capacity))
         errors.append(
             f"テーブル上限({max_per_table}名)を超えているテーブルがあります: {over_capacity_str}"
+        )
+
+    rows_by_table: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        rows_by_table[int(row["table_no"])].append(row)
+
+    skill_conflict_tables: list[int] = []
+    for table_no, members in rows_by_table.items():
+        conflict_found = False
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                if _is_forbidden_skill_pair(
+                    str(members[i]["skill_level"]), str(members[j]["skill_level"])
+                ):
+                    conflict_found = True
+                    break
+            if conflict_found:
+                break
+        if conflict_found:
+            skill_conflict_tables.append(table_no)
+
+    if skill_conflict_tables:
+        table_str = ", ".join(str(no) for no in sorted(skill_conflict_tables))
+        errors.append(
+            "スキル制約に違反する同席があります。"
+            f"（高い×低い / 高い×ヤバい） テーブル: {table_str}"
         )
     return errors
 

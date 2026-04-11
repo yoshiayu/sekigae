@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ import streamlit as st
 from src.constants import (
     DEFAULT_ATTEMPTS,
     DEFAULT_MAX_PER_TABLE,
+    DEFAULT_MIN_PER_TABLE,
     DEFAULT_TABLE_COUNT,
     DEFAULT_WEIGHTS,
     SKILL_COLORS,
@@ -19,6 +21,14 @@ from src.constants import (
 )
 from src.csv_service import parse_students_csv, rows_to_assignment_csv, template_csv_text
 from src.db import init_db
+from src.layout_export import (
+    build_layout_payload,
+    default_daily_sheet_name,
+    default_table_layout_rows,
+    export_layouts_to_excel_bytes,
+    publish_layouts_to_google_sheets,
+    safe_download_filename,
+)
 from src.repository import (
     bulk_insert_students,
     bulk_update_student_skills_by_name,
@@ -47,6 +57,9 @@ from src.seating import (
 
 st.set_page_config(page_title="受講生席替えアプリ", page_icon="席", layout="wide")
 init_db()
+
+_LAYOUT_ROW_LABELS = ("前列（スクリーン側）", "中列", "後列（後方）")
+_LAYOUT_ROW_LIMITS = (4, 5, 4)
 
 
 def _current_iso_week() -> str:
@@ -85,11 +98,121 @@ def _skill_badge(skill: str) -> str:
     )
 
 
+def _config_from_settings(settings: dict[str, Any] | None) -> SeatingConfig:
+    if not isinstance(settings, dict):
+        return SeatingConfig()
+    allowed = set(SeatingConfig.__dataclass_fields__.keys())
+    filtered = {key: value for key, value in settings.items() if key in allowed}
+    return SeatingConfig(**filtered)
+
+
+def _layout_row_to_text(row: list[int]) -> str:
+    return ",".join(str(no) for no in row)
+
+
+def _default_layout_rows_for_count(table_count: int) -> list[list[int]]:
+    return [list(row) for row in default_table_layout_rows(max(0, int(table_count)))]
+
+
+def _parse_layout_row_text(value: str) -> tuple[list[int], list[str]]:
+    tokens = [token for token in re.split(r"[,\s、]+", str(value).strip()) if token]
+    row: list[int] = []
+    invalid: list[str] = []
+    for token in tokens:
+        try:
+            row.append(int(token))
+        except ValueError:
+            invalid.append(token)
+    return row, invalid
+
+
+def _validate_layout_rows(layout_rows: list[list[int]], table_count: int) -> list[str]:
+    errors: list[str] = []
+    if len(layout_rows) != 3:
+        return ["レイアウト行数が不正です。前列・中列・後列の3行を設定してください。"]
+
+    for idx, (row, limit) in enumerate(zip(layout_rows, _LAYOUT_ROW_LIMITS)):
+        if len(row) > limit:
+            errors.append(
+                f"{_LAYOUT_ROW_LABELS[idx]}は最大{limit}テーブルまでです。"
+            )
+
+    flat = [no for row in layout_rows for no in row]
+    out_of_range = sorted({no for no in flat if no < 1 or no > table_count})
+    if out_of_range:
+        errors.append(
+            f"レイアウトに範囲外のテーブル番号があります: {', '.join(str(no) for no in out_of_range)}"
+        )
+
+    duplicates = sorted({no for no in flat if flat.count(no) > 1})
+    if duplicates:
+        errors.append(
+            f"レイアウトに重複テーブル番号があります: {', '.join(str(no) for no in duplicates)}"
+        )
+
+    expected = set(range(1, table_count + 1))
+    provided = set(flat)
+    missing = sorted(expected - provided)
+    if missing:
+        errors.append(
+            f"レイアウト未指定のテーブルがあります: {', '.join(str(no) for no in missing)}"
+        )
+    return errors
+
+
+def _coerce_layout_rows(
+    candidate: Any,
+    table_count: int,
+) -> list[list[int]]:
+    default_rows = _default_layout_rows_for_count(table_count)
+    if not isinstance(candidate, list) or len(candidate) != 3:
+        return default_rows
+    try:
+        rows = [[int(v) for v in row] for row in candidate]
+    except (TypeError, ValueError):
+        return default_rows
+    if _validate_layout_rows(rows, table_count):
+        return default_rows
+    return rows
+
+
+def _ensure_layout_editor_state(table_count: int, layout_rows: list[list[int]]) -> None:
+    marker_key = "layout_editor_table_count"
+    marker_sig_key = "layout_editor_signature"
+    signature = "|".join(_layout_row_to_text(row) for row in layout_rows)
+    if (
+        st.session_state.get(marker_key) != table_count
+        or st.session_state.get(marker_sig_key) != signature
+    ):
+        st.session_state["layout_front_text"] = _layout_row_to_text(layout_rows[0])
+        st.session_state["layout_middle_text"] = _layout_row_to_text(layout_rows[1])
+        st.session_state["layout_back_text"] = _layout_row_to_text(layout_rows[2])
+        st.session_state[marker_key] = table_count
+        st.session_state[marker_sig_key] = signature
+
+
+def _read_layout_rows_from_editor(table_count: int) -> tuple[list[list[int]], list[str]]:
+    row_texts = [
+        st.session_state.get("layout_front_text", ""),
+        st.session_state.get("layout_middle_text", ""),
+        st.session_state.get("layout_back_text", ""),
+    ]
+    parsed_rows: list[list[int]] = []
+    errors: list[str] = []
+    for idx, text in enumerate(row_texts):
+        row, invalid = _parse_layout_row_text(text)
+        parsed_rows.append(row)
+        if invalid:
+            errors.append(
+                f"{_LAYOUT_ROW_LABELS[idx]}に整数以外の値があります: {', '.join(invalid)}"
+            )
+    errors.extend(_validate_layout_rows(parsed_rows, table_count))
+    return parsed_rows, errors
+
+
 def _make_config_from_state() -> SeatingConfig:
     settings = st.session_state.get("current_settings")
-    if isinstance(settings, dict):
-        return SeatingConfig(**settings)
-    return SeatingConfig()
+    return _config_from_settings(settings if isinstance(settings, dict) else None)
 
 
 def _store_result(
@@ -98,16 +221,20 @@ def _store_result(
     metrics: dict[str, Any],
     config: SeatingConfig,
     target_week: str,
+    table_layout_rows: list[list[int]],
     previous_history_id: int | None,
     previous_pairs: set[tuple[int, int]],
     previous_table_map: dict[int, int],
 ) -> None:
+    normalized_layout_rows = _coerce_layout_rows(table_layout_rows, config.table_count)
     st.session_state["current_rows"] = rows
     st.session_state["current_score"] = score
     st.session_state["current_metrics"] = metrics
     st.session_state["current_target_week"] = target_week
+    st.session_state["current_layout_rows"] = normalized_layout_rows
     st.session_state["current_settings"] = {
         "table_count": config.table_count,
+        "min_per_table": config.min_per_table,
         "max_per_table": config.max_per_table,
         "attempts": config.attempts,
         "company_weight": config.company_weight,
@@ -116,6 +243,7 @@ def _store_result(
         "size_weight": config.size_weight,
         "randomness_weight": config.randomness_weight,
         "seed": config.seed,
+        "table_layout_rows": normalized_layout_rows,
     }
     st.session_state["previous_history_id"] = previous_history_id
     st.session_state["previous_pairs"] = previous_pairs
@@ -128,6 +256,7 @@ def _clear_current_result_state() -> None:
         "current_score",
         "current_metrics",
         "current_target_week",
+        "current_layout_rows",
         "current_settings",
         "previous_history_id",
         "previous_pairs",
@@ -487,14 +616,61 @@ with tab_run:
     students_rows = list_students()
     student_count = len(students_rows)
     distribution = Counter(row["skill_level"] for row in students_rows)
-    capacity = DEFAULT_TABLE_COUNT * DEFAULT_MAX_PER_TABLE
+    col_table, col_min, col_max = st.columns(3)
+    with col_table:
+        table_count = int(
+            st.number_input(
+                "使用テーブル数",
+                min_value=1,
+                max_value=DEFAULT_TABLE_COUNT,
+                value=DEFAULT_TABLE_COUNT,
+                step=1,
+                key="run_table_count",
+            )
+        )
+    with col_min:
+        min_per_table = int(
+            st.number_input(
+                "1テーブル最小人数",
+                min_value=1,
+                max_value=DEFAULT_MAX_PER_TABLE,
+                value=DEFAULT_MIN_PER_TABLE,
+                step=1,
+                key="run_min_per_table",
+            )
+        )
+    with col_max:
+        max_per_table = int(
+            st.number_input(
+                "1テーブル最大人数",
+                min_value=min_per_table,
+                max_value=DEFAULT_MAX_PER_TABLE,
+                value=max(min_per_table, DEFAULT_MAX_PER_TABLE),
+                step=1,
+                key="run_max_per_table",
+            )
+        )
 
-    col_info1, col_info2, col_info3 = st.columns(3)
+    min_required = table_count * min_per_table
+    capacity = table_count * max_per_table
+
+    col_info1, col_info2, col_info3, col_info4 = st.columns(4)
     col_info1.metric("登録人数", f"{student_count}名")
-    col_info2.metric("総席数", f"{capacity}席")
-    col_info3.metric("空席", f"{capacity - student_count}席")
+    col_info2.metric("最小必要人数", f"{min_required}名")
+    col_info3.metric("最大収容人数", f"{capacity}名")
+    if student_count < min_required:
+        col_info4.metric("不足", f"{min_required - student_count}名")
+    elif student_count > capacity:
+        col_info4.metric("超過", f"{student_count - capacity}名")
+    else:
+        col_info4.metric("空席", f"{capacity - student_count}席")
     st.write(_skill_distribution_text(distribution))
 
+    if student_count < min_required:
+        st.error(
+            f"受講生数 {student_count} 名は最小必要人数 {min_required} 名を下回っています。"
+            " テーブル数を減らすか、最小人数を下げてください。"
+        )
     if student_count > capacity:
         st.error(
             f"受講生数 {student_count} 名は上限 {capacity} 名を超えています。"
@@ -513,13 +689,17 @@ with tab_run:
         )
     with col_w2:
         skill_weight = st.slider(
-            "スキル固めの強さ（低い/ヤバい同グループ）",
+            "同スキル固めの強さ（強化）",
             1.0,
             60.0,
             float(DEFAULT_WEIGHTS["skill"]),
             1.0,
         )
         size_weight = st.slider("人数均等化の強さ", 0.0, 10.0, float(DEFAULT_WEIGHTS["size"]), 0.5)
+    st.caption(
+        "スキル同席制約: 高い×低い / 高い×ヤバい は同席しません。"
+        "（並×ヤバい は許可）"
+    )
     with col_w3:
         randomness_weight = st.slider(
             "ランダム性", 0.0, 5.0, float(DEFAULT_WEIGHTS["randomness"]), 0.1
@@ -527,7 +707,7 @@ with tab_run:
         attempts = st.slider("試行回数", 100, 500, DEFAULT_ATTEMPTS, 50)
         seed_text = st.text_input("乱数シード（任意）", value="", key="seed_text")
 
-    run_disabled = student_count == 0 or student_count > capacity
+    run_disabled = student_count == 0 or student_count < min_required or student_count > capacity
     if st.button("席替えを実行", type="primary", disabled=run_disabled, key="run_seating"):
         try:
             seed_value = int(seed_text) if seed_text.strip() else None
@@ -537,8 +717,9 @@ with tab_run:
         else:
             previous_history_id, previous_pairs, previous_table_map = get_previous_context()
             config = SeatingConfig(
-                table_count=DEFAULT_TABLE_COUNT,
-                max_per_table=DEFAULT_MAX_PER_TABLE,
+                table_count=table_count,
+                min_per_table=min_per_table,
+                max_per_table=max_per_table,
                 attempts=attempts,
                 company_weight=company_weight,
                 previous_weight=previous_weight,
@@ -547,23 +728,33 @@ with tab_run:
                 randomness_weight=randomness_weight,
                 seed=seed_value,
             )
-            result = generate_best_assignment(
-                students=_rows_to_students(students_rows),
-                previous_pairs=previous_pairs,
-                previous_table_map=previous_table_map,
-                config=config,
-            )
-            _store_result(
-                rows=result["rows"],
-                score=float(result["score"]),
-                metrics=result["metrics"],
-                config=config,
-                target_week=target_week,
-                previous_history_id=previous_history_id,
-                previous_pairs=previous_pairs,
-                previous_table_map=previous_table_map,
-            )
-            st.success("席替えを生成しました。結果タブで確認できます。")
+            try:
+                result = generate_best_assignment(
+                    students=_rows_to_students(students_rows),
+                    previous_pairs=previous_pairs,
+                    previous_table_map=previous_table_map,
+                    config=config,
+                )
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+                result = None
+            if result is not None:
+                run_layout_rows = _coerce_layout_rows(
+                    st.session_state.get("current_layout_rows"),
+                    config.table_count,
+                )
+                _store_result(
+                    rows=result["rows"],
+                    score=float(result["score"]),
+                    metrics=result["metrics"],
+                    config=config,
+                    target_week=target_week,
+                    table_layout_rows=run_layout_rows,
+                    previous_history_id=previous_history_id,
+                    previous_pairs=previous_pairs,
+                    previous_table_map=previous_table_map,
+                )
+                st.success("席替えを生成しました。結果タブで確認できます。")
 
 
 with tab_result:
@@ -590,6 +781,14 @@ with tab_result:
             f"{100 * float(current_metrics.get('same_table_student_rate', 0.0)):.1f}%",
         )
         metric_cols[3].metric("会社重複数", int(current_metrics.get("company_collision_total", 0)))
+        forbidden_pairs = int(current_metrics.get("forbidden_skill_pair_total", 0))
+        if forbidden_pairs > 0:
+            st.warning(
+                f"収容優先で配置したため、禁止スキル同席が {forbidden_pairs} 組あります。"
+                "（高い×低い / 高い×ヤバい）"
+            )
+        elif bool(current_metrics.get("fallback_used", False)):
+            st.info("厳密解が見つからなかったため、収容優先モードで席替えしています。")
 
         st.markdown("#### 手動調整（table_no を直接変更）")
         df_current = pd.DataFrame(current_rows)
@@ -611,6 +810,7 @@ with tab_result:
             errors = validate_manual_rows(
                 rows=updated_rows,
                 table_count=current_config.table_count,
+                min_per_table=current_config.min_per_table,
                 max_per_table=current_config.max_per_table,
             )
             if errors:
@@ -630,43 +830,111 @@ with tab_result:
                 st.success("手動調整を反映しました。")
                 st.rerun()
 
+        settings_obj = st.session_state.get("current_settings", {})
+        settings_layout_rows = (
+            settings_obj.get("table_layout_rows")
+            if isinstance(settings_obj, dict)
+            else None
+        )
+        initial_layout_rows = _coerce_layout_rows(
+            st.session_state.get("current_layout_rows") or settings_layout_rows,
+            current_config.table_count,
+        )
+        st.session_state["current_layout_rows"] = initial_layout_rows
+        _ensure_layout_editor_state(current_config.table_count, initial_layout_rows)
+
+        st.markdown("#### テーブル配置設定（前4・中5・後4の千鳥）")
+        layout_col1, layout_col2, layout_col3 = st.columns(3)
+        with layout_col1:
+            st.text_input(
+                "前列（左→右の table_no）",
+                key="layout_front_text",
+                help="例: 1,4,7,10",
+            )
+        with layout_col2:
+            st.text_input(
+                "中列（左→右の table_no）",
+                key="layout_middle_text",
+                help="例: 2,5,8,11,13",
+            )
+        with layout_col3:
+            st.text_input(
+                "後列（左→右の table_no）",
+                key="layout_back_text",
+                help="例: 3,6,9,12",
+            )
+
+        if st.button("配置設定を反映", key="apply_layout_rows"):
+            edited_layout_rows, layout_errors = _read_layout_rows_from_editor(
+                current_config.table_count
+            )
+            if layout_errors:
+                for err in layout_errors:
+                    st.error(err)
+            else:
+                st.session_state["current_layout_rows"] = edited_layout_rows
+                if isinstance(settings_obj, dict):
+                    settings_obj["table_layout_rows"] = edited_layout_rows
+                    st.session_state["current_settings"] = settings_obj
+                st.success("配置設定を反映しました。")
+                st.rerun()
+
+        active_layout_rows = _coerce_layout_rows(
+            st.session_state.get("current_layout_rows"),
+            current_config.table_count,
+        )
+
         st.markdown("#### テーブル別表示")
         table_map = build_table_view(current_rows, current_config.table_count)
         table_metrics = {
             int(m["table_no"]): m for m in st.session_state["current_metrics"].get("table_metrics", [])
         }
+        for row_label, row_table_nos in zip(_LAYOUT_ROW_LABELS, active_layout_rows):
+            st.markdown(f"##### {row_label}")
+            if not row_table_nos:
+                st.caption("（設定なし）")
+                continue
+            row_cols = st.columns(len(row_table_nos))
+            for idx, table_no in enumerate(row_table_nos):
+                members = table_map.get(table_no, [])
+                metric = table_metrics.get(table_no, {})
+                with row_cols[idx]:
+                    with st.container(border=True):
+                        st.markdown(f"##### Table {table_no} ({len(members)}名)")
+                        if not members:
+                            st.caption("未配置")
+                        for member in members:
+                            badge = _skill_badge(str(member["skill_level"]))
+                            st.markdown(
+                                (
+                                    f"<div style='padding:6px 8px;border:1px solid #E2E8F0;"
+                                    f"border-radius:8px;margin-bottom:6px;'>"
+                                    f"<strong>{member['name']}</strong><br>"
+                                    f"{member['company']}<br>{badge}</div>"
+                                ),
+                                unsafe_allow_html=True,
+                            )
 
-        columns = st.columns(3)
-        for table_no in range(1, current_config.table_count + 1):
-            col = columns[(table_no - 1) % 3]
-            members = table_map[table_no]
-            metric = table_metrics.get(table_no, {})
+                        duplicate_companies = metric.get("duplicate_companies", {})
+                        if duplicate_companies:
+                            info = ", ".join(f"{k}({v})" for k, v in duplicate_companies.items())
+                            st.warning(f"会社重複: {info}")
 
-            with col:
-                with st.container(border=True):
-                    st.markdown(f"##### Table {table_no} ({len(members)}名)")
-                    if not members:
-                        st.caption("未配置")
-                    for member in members:
-                        badge = _skill_badge(str(member["skill_level"]))
-                        st.markdown(
-                            (
-                                f"<div style='padding:6px 8px;border:1px solid #E2E8F0;"
-                                f"border-radius:8px;margin-bottom:6px;'>"
-                                f"<strong>{member['name']}</strong><br>"
-                                f"{member['company']}<br>{badge}</div>"
-                            ),
-                            unsafe_allow_html=True,
-                        )
+                        prev_hits = int(metric.get("previous_pair_hits", 0))
+                        if prev_hits > 0:
+                            st.caption(f"前回同席ペア重複: {prev_hits}")
 
-                    duplicate_companies = metric.get("duplicate_companies", {})
-                    if duplicate_companies:
-                        info = ", ".join(f"{k}({v})" for k, v in duplicate_companies.items())
-                        st.warning(f"会社重複: {info}")
-
-                    prev_hits = int(metric.get("previous_pair_hits", 0))
-                    if prev_hits > 0:
-                        st.caption(f"前回同席ペア重複: {prev_hits}")
+        displayed_tables = {no for row in active_layout_rows for no in row}
+        hidden_tables = [
+            table_no
+            for table_no in range(1, current_config.table_count + 1)
+            if table_no not in displayed_tables
+        ]
+        if hidden_tables:
+            st.warning(
+                "配置設定に含まれていないため非表示のテーブルがあります: "
+                + ", ".join(str(no) for no in hidden_tables)
+            )
 
         csv_bytes = rows_to_assignment_csv(
             rows=current_rows,
@@ -680,6 +948,101 @@ with tab_result:
             mime="text/csv",
             key="download_current_result_csv",
         )
+
+        st.markdown("#### スプレッドシート形式出力（Excel / Googleスプレッドシート）")
+        export_base_name = st.text_input(
+            "出力名（例: 4月11日の座席表）",
+            value=default_daily_sheet_name(),
+            key="layout_export_base_name",
+            help=(
+                "通常版にこの名前を使い、反転版は自動で「（反転）」を付与します。"
+                " 通常版=後ろ→前の見え方、反転版=前→後ろの見え方です。"
+            ),
+        )
+        layout_payload_excel = build_layout_payload(
+            current_rows,
+            export_base_name,
+            include_skill=False,
+            table_layout_rows=active_layout_rows,
+        )
+        layout_payload_sheet = build_layout_payload(
+            current_rows,
+            export_base_name,
+            include_skill=False,
+            table_layout_rows=active_layout_rows,
+        )
+        xlsx_bytes = export_layouts_to_excel_bytes(
+            normal_grid=layout_payload_excel["normal_grid"],
+            mirrored_grid=layout_payload_excel["mirrored_grid"],
+            normal_sheet_name=str(layout_payload_excel["normal_name"]),
+            mirrored_sheet_name=str(layout_payload_excel["mirrored_name"]),
+        )
+        st.download_button(
+            label="現在の結果をExcel(.xlsx)で出力（通常版+反転版）",
+            data=xlsx_bytes,
+            file_name=safe_download_filename(
+                str(layout_payload_excel["normal_name"]), suffix=".xlsx"
+            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_current_result_xlsx",
+        )
+        st.caption("Excel/Googleスプレッドシート出力は氏名・会社のみを記載し、スキルは出力しません。")
+
+        st.markdown("##### Googleスプレッドシートへ自動作成")
+        spreadsheet_ref = st.text_input(
+            "出力先スプレッドシートURL/ID",
+            value=(
+                "https://docs.google.com/spreadsheets/d/"
+                "1XsHLia82yBlWYBC8ZfLJ6LARnKHI8OiGk_o78p5d8SI/edit"
+            ),
+            key="google_export_spreadsheet_ref",
+        )
+        template_sheet_name = st.text_input(
+            "テンプレートシート名",
+            value="座席表（テンプレ）",
+            key="google_export_template_sheet_name",
+        )
+        service_account_file = st.file_uploader(
+            "GoogleサービスアカウントJSON",
+            type=["json"],
+            key="google_service_account_json",
+        )
+        st.caption(
+            "サービスアカウントの `client_email` を対象スプレッドシートに編集者として共有してから実行してください。"
+        )
+        if st.button("Googleスプレッドシートへ2種類を作成", key="export_to_google_sheet"):
+            if service_account_file is None:
+                st.error("GoogleサービスアカウントJSONを指定してください。")
+            else:
+                try:
+                    publish_result = publish_layouts_to_google_sheets(
+                        service_account_json_bytes=service_account_file.getvalue(),
+                        spreadsheet_ref=spreadsheet_ref,
+                        template_sheet_name=template_sheet_name,
+                        normal_sheet_name=str(layout_payload_sheet["normal_name"]),
+                        normal_grid=layout_payload_sheet["normal_grid"],
+                        mirrored_sheet_name=str(layout_payload_sheet["mirrored_name"]),
+                        mirrored_grid=layout_payload_sheet["mirrored_grid"],
+                    )
+                except Exception as exc:
+                    st.error(f"スプレッドシート出力に失敗しました: {exc}")
+                else:
+                    st.success("スプレッドシートへ通常版・反転版を作成しました。")
+                    requested_template = str(publish_result.get("requested_template_sheet_name", ""))
+                    used_template = str(publish_result.get("used_template_sheet_name", ""))
+                    if requested_template and used_template and requested_template != used_template:
+                        st.info(
+                            "指定テンプレートが見つからなかったため、"
+                            f"「{used_template}」をテンプレートとして使用しました。"
+                        )
+                    st.markdown(
+                        f"- 通常版: [{publish_result['normal_sheet_name']}]"
+                        f"({publish_result['normal_sheet_url']})"
+                    )
+                    st.markdown(
+                        f"- 反転版: [{publish_result['mirrored_sheet_name']}]"
+                        f"({publish_result['mirrored_sheet_url']})"
+                    )
 
         st.caption("印刷はブラウザ標準機能（Ctrl+P / Cmd+P）を利用してください。")
         if st.button("この結果を履歴に保存", type="primary", key="save_current_history"):
@@ -741,18 +1104,40 @@ with tab_history:
                     settings = json.loads(settings_json)
                 except json.JSONDecodeError:
                     settings = {}
-            config = SeatingConfig(**settings) if settings else SeatingConfig()
+            config = _config_from_settings(settings if settings else None)
+            history_layout_rows = _coerce_layout_rows(
+                settings.get("table_layout_rows") if isinstance(settings, dict) else None,
+                config.table_count,
+            )
 
             table_map = build_table_view(history_rows, config.table_count)
-            cols = st.columns(3)
-            for table_no in range(1, config.table_count + 1):
-                col = cols[(table_no - 1) % 3]
-                members = table_map[table_no]
-                with col:
-                    with st.container(border=True):
-                        st.markdown(f"##### Table {table_no} ({len(members)}名)")
-                        for member in members:
-                            st.write(f"- {member['name']} / {member['company']} / {member['skill_level']}")
+            for row_label, row_table_nos in zip(_LAYOUT_ROW_LABELS, history_layout_rows):
+                st.markdown(f"##### {row_label}")
+                if not row_table_nos:
+                    st.caption("（設定なし）")
+                    continue
+                row_cols = st.columns(len(row_table_nos))
+                for idx, table_no in enumerate(row_table_nos):
+                    members = table_map.get(table_no, [])
+                    with row_cols[idx]:
+                        with st.container(border=True):
+                            st.markdown(f"##### Table {table_no} ({len(members)}名)")
+                            for member in members:
+                                st.write(
+                                    f"- {member['name']} / {member['company']} / {member['skill_level']}"
+                                )
+
+            history_displayed = {no for row in history_layout_rows for no in row}
+            history_hidden = [
+                table_no
+                for table_no in range(1, config.table_count + 1)
+                if table_no not in history_displayed
+            ]
+            if history_hidden:
+                st.caption(
+                    "この履歴で表示対象外のテーブル: "
+                    + ", ".join(str(no) for no in history_hidden)
+                )
 
             history_csv = rows_to_assignment_csv(
                 rows=history_rows,
@@ -781,6 +1166,7 @@ with tab_history:
                     metrics=metrics,
                     config=config,
                     target_week=str(history["target_week"]),
+                    table_layout_rows=history_layout_rows,
                     previous_history_id=latest_history_id,
                     previous_pairs=previous_pairs,
                     previous_table_map=previous_table_map,
