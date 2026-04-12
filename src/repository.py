@@ -25,14 +25,14 @@ def _normalize_student_name(value: str) -> str:
 
 def list_students(search: str = "") -> list[dict[str, Any]]:
     query = """
-        SELECT id, name, company, skill_level, created_at, updated_at
+        SELECT id, name, name_kana, company, skill_level, created_at, updated_at
         FROM students
     """
     params: tuple[Any, ...] = ()
     if search.strip():
-        query += " WHERE name LIKE ? OR company LIKE ? "
+        query += " WHERE name LIKE ? OR name_kana LIKE ? OR company LIKE ? "
         like = f"%{search.strip()}%"
-        params = (like, like)
+        params = (like, like, like)
     query += " ORDER BY id ASC"
 
     with get_connection() as conn:
@@ -44,7 +44,7 @@ def get_student(student_id: int) -> dict[str, Any] | None:
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT id, name, company, skill_level, created_at, updated_at
+            SELECT id, name, name_kana, company, skill_level, created_at, updated_at
             FROM students
             WHERE id = ?
             """,
@@ -53,27 +53,29 @@ def get_student(student_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def create_student(name: str, company: str, skill_level: str) -> int:
+def create_student(name: str, company: str, skill_level: str, name_kana: str = "") -> int:
     with get_connection() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO students (name, company, skill_level, created_at, updated_at)
-            VALUES (?, ?, ?, datetime('now'), datetime('now'))
+            INSERT INTO students (name, name_kana, company, skill_level, created_at, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
             """,
-            (name.strip(), company.strip(), skill_level),
+            (name.strip(), name_kana.strip(), company.strip(), skill_level),
         )
         return int(cursor.lastrowid)
 
 
-def update_student(student_id: int, name: str, company: str, skill_level: str) -> None:
+def update_student(
+    student_id: int, name: str, company: str, skill_level: str, name_kana: str = ""
+) -> None:
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE students
-            SET name = ?, company = ?, skill_level = ?, updated_at = datetime('now')
+            SET name = ?, name_kana = ?, company = ?, skill_level = ?, updated_at = datetime('now')
             WHERE id = ?
             """,
-            (name.strip(), company.strip(), skill_level, student_id),
+            (name.strip(), name_kana.strip(), company.strip(), skill_level, student_id),
         )
 
 
@@ -100,27 +102,51 @@ def bulk_insert_students(rows: list[dict[str, str]]) -> int:
         return 0
 
     with get_connection() as conn:
-        existing_rows = conn.execute("SELECT name, company FROM students").fetchall()
-        existing_keys = {(str(row["name"]), str(row["company"])) for row in existing_rows}
+        existing_rows = conn.execute(
+            "SELECT id, name, company, name_kana FROM students"
+        ).fetchall()
+        existing_by_key = {
+            (str(row["name"]), str(row["company"])): row for row in existing_rows
+        }
+        existing_keys = set(existing_by_key.keys())
         seen_keys = set(existing_keys)
 
-        values: list[tuple[str, str, str]] = []
+        values: list[tuple[str, str, str, str]] = []
+        kana_updates: list[tuple[str, int]] = []
         for row in rows:
             name = row["name"].strip()
+            name_kana = row.get("name_kana", "").strip()
             company = row["company"].strip()
             key = (name, company)
+            if key in existing_by_key:
+                existing = existing_by_key[key]
+                existing_kana = str(existing["name_kana"] or "").strip()
+                # 既存データにふりがなが無い場合は、再インポートで補完する
+                if name_kana and name_kana != existing_kana:
+                    kana_updates.append((name_kana, int(existing["id"])))
+                continue
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            values.append((name, company, row["skill_level"]))
+            values.append((name, name_kana, company, row["skill_level"]))
+
+        if kana_updates:
+            conn.executemany(
+                """
+                UPDATE students
+                SET name_kana = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                kana_updates,
+            )
 
         if not values:
             return 0
 
         conn.executemany(
             """
-            INSERT INTO students (name, company, skill_level, created_at, updated_at)
-            VALUES (?, ?, ?, datetime('now'), datetime('now'))
+            INSERT INTO students (name, name_kana, company, skill_level, created_at, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
             """,
             values,
         )
@@ -239,6 +265,7 @@ def get_history_rows(history_id: int) -> list[dict[str, Any]]:
                 a.table_no,
                 s.id AS student_id,
                 s.name,
+                s.name_kana,
                 s.company,
                 s.skill_level
             FROM seating_assignments a

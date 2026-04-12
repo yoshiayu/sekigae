@@ -17,7 +17,9 @@ from src.constants import (
     DEFAULT_TABLE_COUNT,
     DEFAULT_WEIGHTS,
     SKILL_COLORS,
+    SKILL_DISPLAY_ORDER,
     SKILL_LEVELS,
+    skill_to_display,
 )
 from src.csv_service import parse_students_csv, rows_to_assignment_csv, template_csv_text
 from src.db import init_db
@@ -49,8 +51,10 @@ from src.seating import (
     SeatingConfig,
     Student,
     build_table_view,
+    count_soft_avoid_pairs,
     evaluate_rows,
     generate_best_assignment,
+    optimize_soft_skill_conflicts,
     validate_manual_rows,
 )
 
@@ -74,7 +78,7 @@ def _skill_distribution_text(distribution: dict[str, int]) -> str:
     for skill in SKILL_LEVELS:
         count = distribution.get(skill, 0)
         ratio = (count / total) * 100
-        chunks.append(f"{skill}: {count}名 ({ratio:.1f}%)")
+        chunks.append(f"{skill_to_display(skill)}: {count}名 ({ratio:.1f}%)")
     return " / ".join(chunks)
 
 
@@ -85,6 +89,7 @@ def _rows_to_students(rows: list[dict[str, Any]]) -> list[Student]:
             name=str(row["name"]),
             company=str(row["company"]),
             skill_level=str(row["skill_level"]),
+            name_kana=str(row.get("name_kana", "")),
         )
         for row in rows
     ]
@@ -92,9 +97,10 @@ def _rows_to_students(rows: list[dict[str, Any]]) -> list[Student]:
 
 def _skill_badge(skill: str) -> str:
     color = SKILL_COLORS.get(skill, "#4A5568")
+    label = skill_to_display(skill)
     return (
         f"<span style='background:{color};color:#fff;border-radius:999px;"
-        f"padding:2px 8px;font-size:12px;'>{skill}</span>"
+        f"padding:2px 8px;font-size:12px;'>{label}</span>"
     )
 
 
@@ -296,13 +302,15 @@ def _normalize_skill_input(value: str) -> str | None:
         "b": "並",
         "標準": "並",
         "低い": "低い",
-        "低": "低い",
+        "やや低": "低い",
+        "やや低い": "低い",
         "low": "低い",
         "c": "低い",
         "初級": "低い",
         "ヤバい": "ヤバい",
         "ヤバイ": "ヤバい",
         "やばい": "ヤバい",
+        "低": "ヤバい",
         "危険": "ヤバい",
         "d": "ヤバい",
         "要支援": "ヤバい",
@@ -366,7 +374,7 @@ def _parse_skill_updates_text(text: str) -> tuple[list[tuple[str, str]], list[st
 
         normalized_skill = _normalize_skill_input(skill_raw)
         if normalized_skill is None:
-            allowed = " / ".join(SKILL_LEVELS)
+            allowed = " / ".join(SKILL_DISPLAY_ORDER)
             errors.append(f"{line_no}行目: スキルが不正です（{allowed} のみ可）。")
             continue
 
@@ -453,8 +461,15 @@ with tab_students:
 
     if students:
         df_students = pd.DataFrame(students)
+        df_students_display = df_students.copy()
+        if "skill_level" in df_students_display.columns:
+            df_students_display["skill_level"] = df_students_display["skill_level"].map(
+                skill_to_display
+            )
         st.dataframe(
-            df_students[["id", "name", "company", "skill_level", "updated_at"]],
+            df_students_display[
+                ["id", "name_kana", "name", "company", "skill_level", "updated_at"]
+            ],
             use_container_width=True,
             hide_index=True,
         )
@@ -468,14 +483,20 @@ with tab_students:
         st.markdown("#### 受講生追加")
         with st.form("add_student_form", clear_on_submit=True):
             add_name = st.text_input("氏名", key="add_name")
+            add_name_kana = st.text_input("氏名ふりがな（任意）", key="add_name_kana")
             add_company = st.text_input("会社名", key="add_company")
-            add_skill = st.selectbox("スキル", options=list(SKILL_LEVELS), key="add_skill")
+            add_skill = st.selectbox(
+                "スキル",
+                options=list(SKILL_LEVELS),
+                format_func=skill_to_display,
+                key="add_skill",
+            )
             add_submit = st.form_submit_button("追加")
         if add_submit:
             if not add_name.strip() or not add_company.strip():
                 st.error("氏名・会社名は必須です。")
             else:
-                create_student(add_name, add_company, add_skill)
+                create_student(add_name, add_company, add_skill, name_kana=add_name_kana)
                 st.success("受講生を追加しました。")
                 st.rerun()
 
@@ -506,6 +527,11 @@ with tab_students:
                 edit_name = st.text_input(
                     "氏名", value=str(selected["name"]), key=f"edit_name_{selected_id}"
                 )
+                edit_name_kana = st.text_input(
+                    "氏名ふりがな（任意）",
+                    value=str(selected.get("name_kana", "")),
+                    key=f"edit_name_kana_{selected_id}",
+                )
                 edit_company = st.text_input(
                     "会社名",
                     value=str(selected["company"]),
@@ -515,6 +541,7 @@ with tab_students:
                     "スキル",
                     options=list(SKILL_LEVELS),
                     index=list(SKILL_LEVELS).index(str(selected["skill_level"])),
+                    format_func=skill_to_display,
                     key=f"edit_skill_{selected_id}",
                 )
                 edit_submit = st.form_submit_button("更新")
@@ -523,7 +550,13 @@ with tab_students:
                 if not edit_name.strip() or not edit_company.strip():
                     st.error("氏名・会社名は必須です。")
                 else:
-                    update_student(int(selected_id), edit_name, edit_company, edit_skill)
+                    update_student(
+                        int(selected_id),
+                        edit_name,
+                        edit_company,
+                        edit_skill,
+                        name_kana=edit_name_kana,
+                    )
                     st.success("更新しました。")
                     st.rerun()
 
@@ -573,7 +606,7 @@ with tab_students:
         "貼り付けデータ",
         key="bulk_skill_text",
         height=180,
-        placeholder="受講生\tスキル\n山田 太郎\t高い\n佐藤 花子\t並",
+        placeholder="受講生\tスキル\n山田 太郎\t高\n佐藤 花子\t中",
     )
     if st.button("スキル一括更新を実行", key="bulk_update_skill_button"):
         parsed_updates, parse_errors = _parse_skill_updates_text(bulk_skill_text)
@@ -697,8 +730,9 @@ with tab_run:
         )
         size_weight = st.slider("人数均等化の強さ", 0.0, 10.0, float(DEFAULT_WEIGHTS["size"]), 0.5)
     st.caption(
-        "スキル同席制約: 高い×低い / 高い×ヤバい は同席しません。"
-        "（並×ヤバい は許可）"
+        "スキル同席制約: 高×やや低 / 高×低 は同席しません。"
+        " 中×低 は可能な限り回避し、"
+        " 高→中→やや低→低 の隣接スキル同士を優先して混在させます。"
     )
     with col_w3:
         randomness_weight = st.slider(
@@ -785,28 +819,75 @@ with tab_result:
         if forbidden_pairs > 0:
             st.warning(
                 f"収容優先で配置したため、禁止スキル同席が {forbidden_pairs} 組あります。"
-                "（高い×低い / 高い×ヤバい）"
+                "（高×やや低 / 高×低）"
             )
         elif bool(current_metrics.get("fallback_used", False)):
             st.info("厳密解が見つからなかったため、収容優先モードで席替えしています。")
+        soft_avoid_pairs = int(
+            current_metrics.get(
+                "soft_avoid_pair_total",
+                count_soft_avoid_pairs(current_rows, current_config.table_count),
+            )
+        )
+        if soft_avoid_pairs > 0:
+            st.warning(
+                f"中×低 の同席ペアが {soft_avoid_pairs} 組あります。"
+                "下の自動解消ボタンで改善できます。"
+            )
+            if st.button("中×低同席を自動解消", key="auto_fix_soft_conflicts"):
+                fixed_rows = optimize_soft_skill_conflicts(
+                    rows=current_rows,
+                    table_count=current_config.table_count,
+                )
+                before_soft = count_soft_avoid_pairs(current_rows, current_config.table_count)
+                after_soft = count_soft_avoid_pairs(fixed_rows, current_config.table_count)
+                if after_soft < before_soft:
+                    fixed_score, fixed_metrics = evaluate_rows(
+                        rows=fixed_rows,
+                        previous_pairs=previous_pairs,
+                        previous_table_map=previous_table_map,
+                        config=current_config,
+                    )
+                    st.session_state["current_rows"] = fixed_rows
+                    st.session_state["current_score"] = fixed_score
+                    st.session_state["current_metrics"] = fixed_metrics
+                    st.success(
+                        f"中×低同席ペアを {before_soft} → {after_soft} に改善しました。"
+                    )
+                    st.rerun()
+                else:
+                    st.info("自動解消を試しましたが、これ以上は改善できませんでした。")
 
         st.markdown("#### 手動調整（table_no を直接変更）")
         df_current = pd.DataFrame(current_rows)
+        skill_by_student_id = {
+            int(row["student_id"]): str(row["skill_level"]) for row in current_rows
+        }
+        df_current_display = df_current.copy()
+        df_current_display["skill_label"] = df_current_display["skill_level"].map(
+            skill_to_display
+        )
         edited_df = st.data_editor(
-            df_current[["table_no", "student_id", "name", "company", "skill_level"]],
+            df_current_display[
+                ["table_no", "student_id", "name_kana", "name", "company", "skill_label"]
+            ],
             hide_index=True,
             use_container_width=True,
-            disabled=["student_id", "name", "company", "skill_level"],
+            disabled=["student_id", "name_kana", "name", "company", "skill_label"],
             column_config={
+                "skill_label": "スキル",
                 "table_no": st.column_config.NumberColumn(
                     "table_no", min_value=1, max_value=current_config.table_count, step=1
-                )
+                ),
             },
             key="result_editor",
         )
 
         if st.button("手動調整を反映", key="apply_manual_changes"):
             updated_rows = edited_df.to_dict(orient="records")
+            for row in updated_rows:
+                row["skill_level"] = skill_by_student_id.get(int(row["student_id"]), "")
+                row.pop("skill_label", None)
             errors = validate_manual_rows(
                 rows=updated_rows,
                 table_count=current_config.table_count,
@@ -905,10 +986,13 @@ with tab_result:
                             st.caption("未配置")
                         for member in members:
                             badge = _skill_badge(str(member["skill_level"]))
+                            kana = str(member.get("name_kana", "")).strip()
+                            kana_html = f"{kana}<br>" if kana else ""
                             st.markdown(
                                 (
                                     f"<div style='padding:6px 8px;border:1px solid #E2E8F0;"
                                     f"border-radius:8px;margin-bottom:6px;'>"
+                                    f"{kana_html}"
                                     f"<strong>{member['name']}</strong><br>"
                                     f"{member['company']}<br>{badge}</div>"
                                 ),
@@ -951,12 +1035,12 @@ with tab_result:
 
         st.markdown("#### スプレッドシート形式出力（Excel / Googleスプレッドシート）")
         export_base_name = st.text_input(
-            "出力名（例: 4月11日の座席表）",
+            "出力名（例: 4月11日座席表）",
             value=default_daily_sheet_name(),
             key="layout_export_base_name",
             help=(
-                "通常版にこの名前を使い、反転版は自動で「（反転）」を付与します。"
-                " 通常版=後ろ→前の見え方、反転版=前→後ろの見え方です。"
+                "この名前を基準に、通常版は「（受講生視点）」、"
+                "反転版は「（講師視点）」を自動で付与します。"
             ),
         )
         layout_payload_excel = build_layout_payload(
@@ -986,7 +1070,10 @@ with tab_result:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_current_result_xlsx",
         )
-        st.caption("Excel/Googleスプレッドシート出力は氏名・会社のみを記載し、スキルは出力しません。")
+        st.caption(
+            "Excel/Googleスプレッドシート出力は氏名ふりがな・氏名・会社のみを記載し、"
+            "スキルは出力しません。"
+        )
 
         st.markdown("##### Googleスプレッドシートへ自動作成")
         spreadsheet_ref = st.text_input(
@@ -1027,7 +1114,7 @@ with tab_result:
                 except Exception as exc:
                     st.error(f"スプレッドシート出力に失敗しました: {exc}")
                 else:
-                    st.success("スプレッドシートへ通常版・反転版を作成しました。")
+                    st.success("スプレッドシートへ受講生視点・講師視点を作成しました。")
                     requested_template = str(publish_result.get("requested_template_sheet_name", ""))
                     used_template = str(publish_result.get("used_template_sheet_name", ""))
                     if requested_template and used_template and requested_template != used_template:
@@ -1123,8 +1210,13 @@ with tab_history:
                         with st.container(border=True):
                             st.markdown(f"##### Table {table_no} ({len(members)}名)")
                             for member in members:
+                                kana = str(member.get("name_kana", "")).strip()
+                                prefix = f"{kana} / " if kana else ""
                                 st.write(
-                                    f"- {member['name']} / {member['company']} / {member['skill_level']}"
+                                    (
+                                        f"- {prefix}{member['name']} / "
+                                        f"{member['company']} / {skill_to_display(str(member['skill_level']))}"
+                                    )
                                 )
 
             history_displayed = {no for row in history_layout_rows for no in row}

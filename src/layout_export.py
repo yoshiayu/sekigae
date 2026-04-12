@@ -19,6 +19,10 @@ _SCREEN_TOP_CELL = (5, 6)
 _SCREEN_BOTTOM_CELL = (19, 6)
 _SCREEN_TOP_MERGE_RANGE = "F5:Q5"
 _SCREEN_BOTTOM_MERGE_RANGE = "F19:Q19"
+_GOOGLE_MIRROR_START_ROW = 5
+_GOOGLE_MIRROR_START_COL = 2
+_GOOGLE_MIRROR_NUM_ROWS = 14
+_GOOGLE_MIRROR_NUM_COLS = 19
 
 # 座席表（テンプレ）の座標に合わせた 13テーブル x 6席 の配置定義
 # スクリーン視点で千鳥配置: 前4 / 中5 / 後4
@@ -51,6 +55,10 @@ _EXCEL_INVALID_TITLE = re.compile(r"[\\/*?:\[\]]")
 _GOOGLE_INVALID_TITLE = re.compile(r"[\\/?*\[\]:]")
 _FILE_INVALID = re.compile(r"[\\/:*?\"<>|]")
 _DEFAULT_TEMPLATE_SHEET_NAME = "座席表（テンプレ）"
+_SPECIAL_LABEL_KEYWORDS = ("スクリーン", "ホワイトボード", "メイン", "アシスタント")
+_NORMAL_VIEW_SUFFIX = "（受講生視点）"
+_MIRRORED_VIEW_SUFFIX = "（講師視点）"
+_LEGACY_MIRROR_SUFFIX = "（反転）"
 
 _TITLE_FONT = Font(name="Meiryo UI", size=14, bold=True)
 _SCREEN_FONT = Font(name="Meiryo UI", size=13, bold=True)
@@ -66,12 +74,16 @@ _SEAT_FILL = PatternFill(fill_type="solid", fgColor="E9E9E9")
 
 def default_daily_sheet_name(reference_dt: datetime | None = None) -> str:
     dt = reference_dt or datetime.now()
-    return f"{dt.month}月{dt.day}日の座席表"
+    return f"{dt.month}月{dt.day}日座席表"
 
 
 def normalize_base_sheet_name(value: str) -> str:
     text = value.strip()
-    return text if text else default_daily_sheet_name()
+    base = text if text else default_daily_sheet_name()
+    for suffix in (_NORMAL_VIEW_SUFFIX, _MIRRORED_VIEW_SUFFIX, _LEGACY_MIRROR_SUFFIX):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)].strip()
+    return base or default_daily_sheet_name()
 
 
 def default_table_layout_rows(table_count: int = 13) -> list[list[int]]:
@@ -87,8 +99,9 @@ def build_layout_payload(
     include_skill: bool = True,
     table_layout_rows: list[list[int]] | None = None,
 ) -> dict[str, Any]:
-    normal_name = normalize_base_sheet_name(base_sheet_name)
-    mirrored_name = f"{normal_name}（反転）"
+    base_name = normalize_base_sheet_name(base_sheet_name)
+    normal_name = f"{base_name}{_NORMAL_VIEW_SUFFIX}"
+    mirrored_name = f"{base_name}{_MIRRORED_VIEW_SUFFIX}"
     return {
         "normal_name": normal_name,
         "mirrored_name": mirrored_name,
@@ -202,6 +215,7 @@ def publish_layouts_to_google_sheets(
 
     if not service_account_json_bytes:
         raise ValueError("サービスアカウントJSONが空です。")
+    _ = mirrored_grid
 
     try:
         account_info = json.loads(service_account_json_bytes.decode("utf-8-sig"))
@@ -242,11 +256,41 @@ def publish_layouts_to_google_sheets(
     )
 
     ws_normal = template_ws.duplicate(new_sheet_name=normal_title)
-    ws_mirrored = template_ws.duplicate(new_sheet_name=mirrored_title)
 
-    update_range = f"A1:{_to_col_label(TEMPLATE_COLS)}{TEMPLATE_ROWS}"
-    ws_normal.update(range_name=update_range, values=normal_grid)
-    ws_mirrored.update(range_name=update_range, values=mirrored_grid)
+    probe_cols = max(TEMPLATE_COLS, 40)
+    template_range = f"A1:{_to_col_label(probe_cols)}{TEMPLATE_ROWS}"
+    template_raw = template_ws.get(template_range)
+    used_cols = max((len(row) for row in template_raw), default=TEMPLATE_COLS)
+    write_cols = max(TEMPLATE_COLS, used_cols)
+    template_matrix = _normalize_matrix(template_raw, rows=TEMPLATE_ROWS, cols=write_cols)
+
+    kana_lookup = _extract_name_kana_lookup(template_matrix)
+    normal_grid_with_kana = _apply_name_kana_fallback(normal_grid, kana_lookup)
+
+    normal_matrix = [row[:] for row in template_matrix]
+    _overlay_non_empty_grid(
+        normal_matrix,
+        normal_grid_with_kana,
+        limit_cols=TEMPLATE_COLS,
+        skip_special_labels=True,
+    )
+
+    update_range = f"A1:{_to_col_label(write_cols)}{TEMPLATE_ROWS}"
+    ws_normal.update(range_name=update_range, values=normal_matrix)
+    ws_mirrored = ws_normal.duplicate(new_sheet_name=mirrored_title)
+    _apply_google_region_180_mirror(
+        spreadsheet=spreadsheet,
+        source_ws=ws_normal,
+        target_ws=ws_mirrored,
+        start_row=_GOOGLE_MIRROR_START_ROW,
+        start_col=_GOOGLE_MIRROR_START_COL,
+        num_rows=_GOOGLE_MIRROR_NUM_ROWS,
+        num_cols=_GOOGLE_MIRROR_NUM_COLS,
+    )
+    ws_mirrored.update_acell(
+        f"{_to_col_label(_TEMPLATE_TITLE_CELL[1])}{_TEMPLATE_TITLE_CELL[0]}",
+        mirrored_title,
+    )
 
     return {
         "spreadsheet_id": spreadsheet_id,
@@ -351,10 +395,11 @@ def _member_sort_key(row: dict[str, Any]) -> tuple[int, str]:
 
 
 def _format_member_cell(row: dict[str, Any], include_skill: bool) -> str:
+    name_kana = str(row.get("name_kana", "")).strip()
     name = str(row.get("name", "")).strip()
     company = str(row.get("company", "")).strip()
     skill = str(row.get("skill_level", "")).strip()
-    parts = [part for part in (name, company) if part]
+    parts = [part for part in (name_kana, name, company) if part]
     if include_skill and skill:
         parts.append(skill)
     return "\n".join(parts)
@@ -469,6 +514,518 @@ def _to_col_label(col_num: int) -> str:
         n, rem = divmod(n - 1, 26)
         label = chr(65 + rem) + label
     return label
+
+
+def _normalize_matrix(raw: list[list[Any]], rows: int, cols: int) -> list[list[str]]:
+    matrix = [["" for _ in range(cols)] for _ in range(rows)]
+    for r_idx in range(min(rows, len(raw))):
+        row = raw[r_idx]
+        for c_idx in range(min(cols, len(row))):
+            value = row[c_idx]
+            matrix[r_idx][c_idx] = "" if value is None else str(value)
+    return matrix
+
+
+def _overlay_non_empty_grid(
+    base_matrix: list[list[str]],
+    grid: list[list[str]],
+    limit_cols: int,
+    skip_special_labels: bool = False,
+) -> None:
+    max_rows = min(len(base_matrix), len(grid))
+    max_cols = min(limit_cols, len(base_matrix[0]) if base_matrix else 0)
+    for r_idx in range(max_rows):
+        row_values = grid[r_idx]
+        for c_idx in range(min(max_cols, len(row_values))):
+            value = str(row_values[c_idx]) if row_values[c_idx] is not None else ""
+            if value:
+                if skip_special_labels:
+                    normalized = _normalize_label_text(value)
+                    if any(keyword in normalized for keyword in _SPECIAL_LABEL_KEYWORDS):
+                        continue
+                base_matrix[r_idx][c_idx] = value
+
+
+def _rotate_matrix_region_180(
+    matrix: list[list[str]],
+    start_row: int,
+    start_col: int,
+    num_rows: int,
+    num_cols: int,
+) -> None:
+    if not matrix or num_rows <= 0 or num_cols <= 0:
+        return
+    row_start = max(0, start_row - 1)
+    col_start = max(0, start_col - 1)
+    row_end = min(len(matrix), row_start + num_rows)
+    if row_start >= row_end:
+        return
+    col_end = min(min(len(row) for row in matrix), col_start + num_cols)
+    if col_start >= col_end:
+        return
+
+    region = [row[col_start:col_end] for row in matrix[row_start:row_end]]
+    reversed_region = [list(reversed(row)) for row in reversed(region)]
+    for r_idx, row_values in enumerate(reversed_region, start=row_start):
+        matrix[r_idx][col_start:col_end] = row_values
+
+
+def _apply_google_region_180_mirror(
+    spreadsheet: Any,
+    source_ws: Any,
+    target_ws: Any,
+    start_row: int,
+    start_col: int,
+    num_rows: int,
+    num_cols: int,
+) -> None:
+    mirror_range = _a1_range(start_row, start_col, num_rows, num_cols)
+
+    source_values_raw = source_ws.get(mirror_range)
+    source_values = _normalize_matrix(source_values_raw, rows=num_rows, cols=num_cols)
+    reversed_values = [list(reversed(row)) for row in reversed(source_values)]
+
+    target_ws.unmerge_cells(mirror_range)
+    target_ws.batch_clear([mirror_range])
+    target_ws.update(range_name=mirror_range, values=reversed_values)
+
+    format_requests = _build_google_format_rotate_requests(
+        source_sheet_id=int(source_ws.id),
+        target_sheet_id=int(target_ws.id),
+        start_row=start_row,
+        start_col=start_col,
+        num_rows=num_rows,
+        num_cols=num_cols,
+    )
+    if format_requests:
+        spreadsheet.batch_update({"requests": format_requests})
+
+    _reverse_google_dimensions(
+        spreadsheet=spreadsheet,
+        source_ws=source_ws,
+        target_ws=target_ws,
+        start_row=start_row,
+        start_col=start_col,
+        num_rows=num_rows,
+        num_cols=num_cols,
+    )
+
+    source_merges = _get_google_sheet_merges(
+        spreadsheet=spreadsheet,
+        sheet_id=int(source_ws.id),
+    )
+    merged_entries = _filter_merges_in_region(
+        source_merges=source_merges,
+        start_row=start_row,
+        start_col=start_col,
+        num_rows=num_rows,
+        num_cols=num_cols,
+    )
+
+    merge_format_requests: list[dict[str, Any]] = []
+    for merge in merged_entries:
+        dst_merge = _rotate_merge_180(
+            merge=merge,
+            start_row=start_row,
+            start_col=start_col,
+            num_rows=num_rows,
+            num_cols=num_cols,
+        )
+        target_ws.merge_cells(_grid_range_to_a1(dst_merge))
+        merge_format_requests.append(
+            {
+                "copyPaste": {
+                    "source": {
+                        "sheetId": int(source_ws.id),
+                        "startRowIndex": int(merge["startRowIndex"]),
+                        "endRowIndex": int(merge["endRowIndex"]),
+                        "startColumnIndex": int(merge["startColumnIndex"]),
+                        "endColumnIndex": int(merge["endColumnIndex"]),
+                    },
+                    "destination": {
+                        "sheetId": int(target_ws.id),
+                        "startRowIndex": int(dst_merge["startRowIndex"]),
+                        "endRowIndex": int(dst_merge["endRowIndex"]),
+                        "startColumnIndex": int(dst_merge["startColumnIndex"]),
+                        "endColumnIndex": int(dst_merge["endColumnIndex"]),
+                    },
+                    "pasteType": "PASTE_FORMAT",
+                    "pasteOrientation": "NORMAL",
+                }
+            }
+        )
+
+        src_value = _get_single_display_value(source_ws, _grid_range_to_a1(merge))
+        if src_value:
+            target_ws.update_acell(
+                _cell_a1(dst_merge["startRowIndex"] + 1, dst_merge["startColumnIndex"] + 1),
+                src_value,
+            )
+    if merge_format_requests:
+        spreadsheet.batch_update({"requests": merge_format_requests})
+
+
+def _a1_range(start_row: int, start_col: int, num_rows: int, num_cols: int) -> str:
+    end_row = start_row + num_rows - 1
+    end_col = start_col + num_cols - 1
+    return f"{_to_col_label(start_col)}{start_row}:{_to_col_label(end_col)}{end_row}"
+
+
+def _cell_a1(row: int, col: int) -> str:
+    return f"{_to_col_label(col)}{row}"
+
+
+def _grid_range_to_a1(grid_range: dict[str, int]) -> str:
+    start_row = int(grid_range["startRowIndex"]) + 1
+    end_row = int(grid_range["endRowIndex"])
+    start_col = int(grid_range["startColumnIndex"]) + 1
+    end_col = int(grid_range["endColumnIndex"])
+    return f"{_to_col_label(start_col)}{start_row}:{_to_col_label(end_col)}{end_row}"
+
+
+def _build_google_format_rotate_requests(
+    source_sheet_id: int,
+    target_sheet_id: int,
+    start_row: int,
+    start_col: int,
+    num_rows: int,
+    num_cols: int,
+) -> list[dict[str, Any]]:
+    row_start0 = start_row - 1
+    col_start0 = start_col - 1
+    requests: list[dict[str, Any]] = []
+    for r_idx in range(num_rows):
+        for c_idx in range(num_cols):
+            src_row0 = row_start0 + r_idx
+            src_col0 = col_start0 + c_idx
+            dst_row0 = row_start0 + (num_rows - 1 - r_idx)
+            dst_col0 = col_start0 + (num_cols - 1 - c_idx)
+            requests.append(
+                {
+                    "copyPaste": {
+                        "source": {
+                            "sheetId": int(source_sheet_id),
+                            "startRowIndex": src_row0,
+                            "endRowIndex": src_row0 + 1,
+                            "startColumnIndex": src_col0,
+                            "endColumnIndex": src_col0 + 1,
+                        },
+                        "destination": {
+                            "sheetId": int(target_sheet_id),
+                            "startRowIndex": dst_row0,
+                            "endRowIndex": dst_row0 + 1,
+                            "startColumnIndex": dst_col0,
+                            "endColumnIndex": dst_col0 + 1,
+                        },
+                        "pasteType": "PASTE_FORMAT",
+                        "pasteOrientation": "NORMAL",
+                    }
+                }
+            )
+    return requests
+
+
+def _reverse_google_dimensions(
+    spreadsheet: Any,
+    source_ws: Any,
+    target_ws: Any,
+    start_row: int,
+    start_col: int,
+    num_rows: int,
+    num_cols: int,
+) -> None:
+    source_title = str(source_ws.title).replace("'", "''")
+    mirror_range = _a1_range(start_row, start_col, num_rows, num_cols)
+    try:
+        metadata = spreadsheet.fetch_sheet_metadata(
+            params={
+                "includeGridData": True,
+                "ranges": [f"'{source_title}'!{mirror_range}"],
+            }
+        )
+    except Exception:
+        return
+
+    source_sheet_data: dict[str, Any] | None = None
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        if int(properties.get("sheetId", -1)) == int(source_ws.id):
+            source_sheet_data = sheet
+            break
+    if source_sheet_data is None:
+        return
+
+    data_blocks = source_sheet_data.get("data", [])
+    if not data_blocks:
+        return
+    block = data_blocks[0]
+    col_meta = block.get("columnMetadata", []) or []
+    row_meta = block.get("rowMetadata", []) or []
+
+    col_sizes = [int(meta.get("pixelSize")) for meta in col_meta if meta.get("pixelSize")]
+    row_sizes = [int(meta.get("pixelSize")) for meta in row_meta if meta.get("pixelSize")]
+    if not col_sizes and not row_sizes:
+        return
+
+    col_start0 = start_col - 1
+    row_start0 = start_row - 1
+    requests: list[dict[str, Any]] = []
+    for idx, size in enumerate(col_sizes[:num_cols]):
+        dst_col0 = col_start0 + (num_cols - 1 - idx)
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": int(target_ws.id),
+                        "dimension": "COLUMNS",
+                        "startIndex": dst_col0,
+                        "endIndex": dst_col0 + 1,
+                    },
+                    "properties": {"pixelSize": size},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+    for idx, size in enumerate(row_sizes[:num_rows]):
+        dst_row0 = row_start0 + (num_rows - 1 - idx)
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": int(target_ws.id),
+                        "dimension": "ROWS",
+                        "startIndex": dst_row0,
+                        "endIndex": dst_row0 + 1,
+                    },
+                    "properties": {"pixelSize": size},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+    if requests:
+        spreadsheet.batch_update({"requests": requests})
+
+
+def _get_google_sheet_merges(spreadsheet: Any, sheet_id: int) -> list[dict[str, int]]:
+    metadata = spreadsheet.fetch_sheet_metadata()
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        if int(properties.get("sheetId", -1)) == int(sheet_id):
+            merges = sheet.get("merges", [])
+            return [dict(merge) for merge in merges]
+    return []
+
+
+def _filter_merges_in_region(
+    source_merges: list[dict[str, int]],
+    start_row: int,
+    start_col: int,
+    num_rows: int,
+    num_cols: int,
+) -> list[dict[str, int]]:
+    row_start = start_row - 1
+    row_end = row_start + num_rows
+    col_start = start_col - 1
+    col_end = col_start + num_cols
+
+    selected: list[dict[str, int]] = []
+    for merge in source_merges:
+        m_row_start = int(merge.get("startRowIndex", -1))
+        m_row_end = int(merge.get("endRowIndex", -1))
+        m_col_start = int(merge.get("startColumnIndex", -1))
+        m_col_end = int(merge.get("endColumnIndex", -1))
+        if (
+            m_row_start >= row_start
+            and m_row_end <= row_end
+            and m_col_start >= col_start
+            and m_col_end <= col_end
+        ):
+            selected.append(
+                {
+                    "startRowIndex": m_row_start,
+                    "endRowIndex": m_row_end,
+                    "startColumnIndex": m_col_start,
+                    "endColumnIndex": m_col_end,
+                }
+            )
+    return selected
+
+
+def _rotate_merge_180(
+    merge: dict[str, int],
+    start_row: int,
+    start_col: int,
+    num_rows: int,
+    num_cols: int,
+) -> dict[str, int]:
+    row_start = start_row - 1
+    col_start = start_col - 1
+    m_row_start = int(merge["startRowIndex"])
+    m_row_end = int(merge["endRowIndex"])
+    m_col_start = int(merge["startColumnIndex"])
+    m_col_end = int(merge["endColumnIndex"])
+    m_rows = m_row_end - m_row_start
+    m_cols = m_col_end - m_col_start
+
+    rel_row = m_row_start - row_start
+    rel_col = m_col_start - col_start
+
+    dst_row_start = row_start + (num_rows - rel_row - m_rows)
+    dst_col_start = col_start + (num_cols - rel_col - m_cols)
+    return {
+        "startRowIndex": dst_row_start,
+        "endRowIndex": dst_row_start + m_rows,
+        "startColumnIndex": dst_col_start,
+        "endColumnIndex": dst_col_start + m_cols,
+    }
+
+
+def _get_single_display_value(worksheet: Any, a1_range: str) -> str:
+    values = worksheet.get(a1_range)
+    if not values:
+        return ""
+    first_row = values[0]
+    if not first_row:
+        return ""
+    return str(first_row[0] or "")
+
+
+def _mirror_special_labels(matrix: list[list[str]], max_cols: int) -> None:
+    if not matrix:
+        return
+    rows = len(matrix)
+    labels: list[tuple[int, int, str]] = []
+    for r_idx in range(rows):
+        for c_idx in range(min(max_cols, len(matrix[r_idx]))):
+            text = str(matrix[r_idx][c_idx]).strip()
+            if not text:
+                continue
+            normalized = _normalize_label_text(text)
+            if any(keyword in normalized for keyword in _SPECIAL_LABEL_KEYWORDS):
+                labels.append((r_idx + 1, c_idx + 1, text))
+
+    for r, c, _ in labels:
+        matrix[r - 1][c - 1] = ""
+
+    seat_col_min = min(_SEAT_COLS)
+    seat_col_max = max(_SEAT_COLS)
+    label_rows = [row for row, _, _ in labels]
+    label_cols = [col for _, col, _ in labels]
+    mirror_row_min = min(_SCREEN_TOP_CELL[0], min(label_rows))
+    mirror_row_max = max(_SCREEN_BOTTOM_CELL[0], max(label_rows))
+    mirror_col_min = min(seat_col_min, min(label_cols))
+    mirror_col_max = max(seat_col_max, max(label_cols))
+
+    for row, col, text in labels:
+        mapped_row, mapped_col = _map_position_180(
+            row=row,
+            col=col,
+            row_min=mirror_row_min,
+            row_max=mirror_row_max,
+            col_min=mirror_col_min,
+            col_max=mirror_col_max,
+        )
+        if 1 <= mapped_row <= rows and 1 <= mapped_col <= max_cols:
+            matrix[mapped_row - 1][mapped_col - 1] = text
+
+
+def _map_position_180(
+    row: int,
+    col: int,
+    row_min: int,
+    row_max: int,
+    col_min: int,
+    col_max: int,
+) -> tuple[int, int]:
+    mapped_row = row_min + row_max - row
+    mapped_col = col_min + col_max - col
+    return mapped_row, mapped_col
+
+
+def _normalize_label_text(value: str) -> str:
+    return re.sub(r"\s+", "", value).strip()
+
+
+def _is_kana_text(value: str) -> bool:
+    text = _normalize_label_text(value)
+    if not text:
+        return False
+    allowed = set("ぁあぃいぅうぇえぉおかがきぎくぐけげこごさざしじすずせぜそぞただちぢっつづてでとどなにぬねのはばぱひびぴふぶぷへべぺほぼぽまみむめもゃやゅゆょよらりるれろゎわゐゑをんーァアィイゥウェエォオカガキギクグケゲコゴサザシジスズセゼソゾタダチヂッツヅテデトドナニヌネノハバパヒビピフブプヘベペホボポマミムメモャヤュユョヨラリルレロヮワヰヱヲンヴ・ ")
+    return all(ch in allowed for ch in text)
+
+
+def _extract_name_kana_lookup(template_matrix: list[list[str]]) -> dict[tuple[str, str], str]:
+    lookup: dict[tuple[str, str], str] = {}
+    for row in template_matrix:
+        for cell in row:
+            text = str(cell or "").strip()
+            if not text or "\n" not in text:
+                continue
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            if len(lines) < 2:
+                continue
+
+            kana = ""
+            name = ""
+            company = ""
+            if len(lines) >= 3 and _is_kana_text(lines[0]):
+                kana = lines[0]
+                name = lines[1]
+                company = lines[2]
+            elif len(lines) >= 2 and _is_kana_text(lines[0]):
+                kana = lines[0]
+                name = lines[1]
+                company = lines[2] if len(lines) >= 3 else ""
+
+            if kana and name:
+                name_key = _normalize_person_key(name)
+                company_key = _normalize_person_key(company)
+                lookup[(name_key, company_key)] = kana
+                if (name_key, "") not in lookup:
+                    lookup[(name_key, "")] = kana
+    return lookup
+
+
+def _apply_name_kana_fallback(
+    grid: list[list[str]], kana_lookup: dict[tuple[str, str], str]
+) -> list[list[str]]:
+    if not kana_lookup:
+        return [row[:] for row in grid]
+
+    updated = [row[:] for row in grid]
+    for row_no, col_no in _SEAT_COORDS:
+        r_idx = row_no - 1
+        c_idx = col_no - 1
+        if r_idx < 0 or r_idx >= len(updated):
+            continue
+        if c_idx < 0 or c_idx >= len(updated[r_idx]):
+            continue
+        text = str(updated[r_idx][c_idx] or "").strip()
+        if not text:
+            continue
+
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if len(lines) < 2:
+            continue
+        if _is_kana_text(lines[0]):
+            continue
+
+        name = _normalize_person_key(lines[0])
+        company = _normalize_person_key(lines[1] if len(lines) >= 2 else "")
+        kana = kana_lookup.get((name, company)) or kana_lookup.get((name, ""))
+        if not kana:
+            continue
+
+        rebuilt = [kana, lines[0]]
+        rebuilt.extend(lines[1:])
+        updated[r_idx][c_idx] = "\n".join(rebuilt)
+    return updated
+
+
+def _normalize_person_key(value: str) -> str:
+    return " ".join(str(value).replace("　", " ").strip().split())
 
 
 def _resolve_template_sheet_name(requested_name: str, available_titles: list[str]) -> str:

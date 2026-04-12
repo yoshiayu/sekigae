@@ -16,6 +16,7 @@ from .constants import (
 )
 
 _SKILL_PRIORITY = {skill: idx for idx, skill in enumerate(SKILL_LEVELS)}
+_SOFT_AVOID_PAIR = frozenset(("並", "ヤバい"))
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class Student:
     name: str
     company: str
     skill_level: str
+    name_kana: str = ""
 
 
 @dataclass(frozen=True)
@@ -52,10 +54,14 @@ def _skill_group(skill_level: str) -> str:
 
 def _is_forbidden_skill_pair(skill_a: str, skill_b: str) -> bool:
     # Hard constraints:
-    # - 高い×低い は禁止
-    # - 高い×ヤバい は禁止
+    # - 高×やや低 は禁止
+    # - 高×低 は禁止
     pair = frozenset((skill_a, skill_b))
     return pair in {frozenset(("高い", "低い")), frozenset(("高い", "ヤバい"))}
+
+
+def _is_soft_avoid_pair(skill_a: str, skill_b: str) -> bool:
+    return frozenset((skill_a, skill_b)) == _SOFT_AVOID_PAIR
 
 
 def _bounded_balanced_table_sizes(
@@ -156,16 +162,19 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
     while remaining:
         # Most-constrained-first: choose student with fewest compatible tables.
         best_idx: int | None = None
-        best_candidates: list[int] = []
+        best_candidates: list[tuple[int, int]] = []
 
         for idx, student in enumerate(remaining):
-            candidate_tables: list[int] = []
+            candidate_tables: list[tuple[int, int]] = []
             for table_idx, members in enumerate(tables):
                 if len(members) >= target_sizes[table_idx]:
                     continue
                 if any(_is_forbidden_skill_pair(student.skill_level, m.skill_level) for m in members):
                     continue
-                candidate_tables.append(table_idx)
+                soft_avoid_count = sum(
+                    1 for m in members if _is_soft_avoid_pair(student.skill_level, m.skill_level)
+                )
+                candidate_tables.append((table_idx, soft_avoid_count))
 
             if best_idx is None or len(candidate_tables) < len(best_candidates):
                 best_idx = idx
@@ -179,15 +188,17 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
             )
 
         student = remaining.pop(best_idx)
-        # Prefer tables with larger remaining capacity, then less size deviation.
-        best_candidates.sort(
+        # Prefer tables with no 中×低 conflicts, then larger remaining capacity.
+        min_soft_conflict = min(soft for _, soft in best_candidates)
+        filtered_candidates = [item for item in best_candidates if item[1] == min_soft_conflict]
+        filtered_candidates.sort(
             key=lambda t: (
-                -(target_sizes[t] - len(tables[t])),
-                abs((len(tables[t]) + 1) - target_sizes[t]),
+                -(target_sizes[t[0]] - len(tables[t[0]])),
+                abs((len(tables[t[0]]) + 1) - target_sizes[t[0]]),
                 rng.random(),
             )
         )
-        chosen_table = best_candidates[0]
+        chosen_table = filtered_candidates[0][0]
         tables[chosen_table].append(student)
     return _students_to_rows(tables)
 
@@ -201,6 +212,7 @@ def _students_to_rows(tables: list[list[Student]]) -> list[dict[str, Any]]:
                     "table_no": table_idx,
                     "student_id": student.id,
                     "name": student.name,
+                    "name_kana": student.name_kana,
                     "company": student.company,
                     "skill_level": student.skill_level,
                 }
@@ -255,6 +267,107 @@ def _renumber_tables_by_skill_priority(
     return renumbered
 
 
+def _soft_conflict_pairs_from_skills(skills: list[str]) -> int:
+    normal_count = sum(1 for s in skills if s == "並")
+    yabai_count = sum(1 for s in skills if s == "ヤバい")
+    return normal_count * yabai_count
+
+
+def _soft_avoid_pair_total(rows: list[dict[str, Any]], table_count: int) -> int:
+    grouped_skills: dict[int, list[str]] = {table_no: [] for table_no in range(1, table_count + 1)}
+    for row in rows:
+        table_no = int(row["table_no"])
+        if table_no in grouped_skills:
+            grouped_skills[table_no].append(str(row.get("skill_level", "")).strip())
+    return sum(_soft_conflict_pairs_from_skills(skills) for skills in grouped_skills.values())
+
+
+def _has_hard_conflict_in_skills(skills: list[str]) -> bool:
+    for i in range(len(skills)):
+        for j in range(i + 1, len(skills)):
+            if _is_forbidden_skill_pair(skills[i], skills[j]):
+                return True
+    return False
+
+
+def _optimize_soft_avoid_pairs(rows: list[dict[str, Any]], table_count: int) -> list[dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {table_no: [] for table_no in range(1, table_count + 1)}
+    working_rows = [dict(row) for row in rows]
+    for row in working_rows:
+        grouped[int(row["table_no"])].append(row)
+
+    max_passes = 400
+    for _ in range(max_passes):
+        improved = False
+        for left_table in range(1, table_count + 1):
+            left_members = grouped[left_table]
+            if not left_members:
+                continue
+            left_skills = [str(m["skill_level"]) for m in left_members]
+            left_soft_before = _soft_conflict_pairs_from_skills(left_skills)
+
+            for right_table in range(left_table + 1, table_count + 1):
+                right_members = grouped[right_table]
+                if not right_members:
+                    continue
+                right_skills = [str(m["skill_level"]) for m in right_members]
+                right_soft_before = _soft_conflict_pairs_from_skills(right_skills)
+                before_total = left_soft_before + right_soft_before
+
+                for li, left_student in enumerate(left_members):
+                    left_skill = str(left_student["skill_level"])
+                    for ri, right_student in enumerate(right_members):
+                        right_skill = str(right_student["skill_level"])
+                        if left_skill == right_skill:
+                            continue
+
+                        next_left_skills = left_skills[:]
+                        next_right_skills = right_skills[:]
+                        next_left_skills[li] = right_skill
+                        next_right_skills[ri] = left_skill
+
+                        if _has_hard_conflict_in_skills(next_left_skills):
+                            continue
+                        if _has_hard_conflict_in_skills(next_right_skills):
+                            continue
+
+                        after_total = (
+                            _soft_conflict_pairs_from_skills(next_left_skills)
+                            + _soft_conflict_pairs_from_skills(next_right_skills)
+                        )
+                        if after_total >= before_total:
+                            continue
+
+                        # Apply improving swap.
+                        left_members[li], right_members[ri] = right_student, left_student
+                        left_members[li]["table_no"] = left_table
+                        right_members[ri]["table_no"] = right_table
+                        improved = True
+                        break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    optimized: list[dict[str, Any]] = []
+    for table_no in range(1, table_count + 1):
+        optimized.extend(grouped[table_no])
+    optimized.sort(key=lambda r: (int(r["table_no"]), int(r["student_id"])))
+    return optimized
+
+
+def optimize_soft_skill_conflicts(rows: list[dict[str, Any]], table_count: int) -> list[dict[str, Any]]:
+    return _optimize_soft_avoid_pairs(rows, table_count)
+
+
+def count_soft_avoid_pairs(rows: list[dict[str, Any]], table_count: int) -> int:
+    return int(_soft_avoid_pair_total(rows, table_count))
+
+
 def _evaluate_assignment(
     rows: list[dict[str, Any]],
     previous_pairs: set[tuple[int, int]],
@@ -280,6 +393,7 @@ def _evaluate_assignment(
     skill_mixing_total = 0.0
     exact_skill_mixing_total = 0.0
     forbidden_skill_pair_total = 0
+    soft_avoid_pair_total = 0
     size_deviation_total = 0.0
     current_pairs: set[tuple[int, int]] = set()
 
@@ -310,6 +424,9 @@ def _evaluate_assignment(
                     forbidden_skill_pair_total += 1
 
         total_pairs = len(members) * (len(members) - 1) // 2
+        soft_avoid_pair_total += _soft_conflict_pairs_from_skills(
+            [str(m["skill_level"]) for m in members]
+        )
         same_group_pairs = sum(
             count * (count - 1) // 2 for count in skill_group_counter.values()
         )
@@ -371,6 +488,7 @@ def _evaluate_assignment(
         "skill_mixing_total": round(skill_mixing_total, 3),
         "exact_skill_mixing_total": round(exact_skill_mixing_total, 3),
         "forbidden_skill_pair_total": forbidden_skill_pair_total,
+        "soft_avoid_pair_total": int(soft_avoid_pair_total),
         # Keep the old key so existing UI/session data can still read it.
         "skill_deviation_total": round(skill_mixing_total, 3),
         "size_deviation_total": round(size_deviation_total, 3),
@@ -417,6 +535,7 @@ def _single_attempt(
     rng.shuffle(order)
     order.sort(
         key=lambda s: (
+            _SKILL_PRIORITY.get(s.skill_level, len(_SKILL_PRIORITY)),  # 高 -> 中 -> やや低 -> 低
             skill_group_counts.get(_skill_group(s.skill_level), 0),  # レアなグループを先に置く
             skill_counts.get(s.skill_level, 0),  # 同グループ内のレア度
             -company_counts.get(s.company, 0),  # 人数が多い会社を先に分散
@@ -427,7 +546,7 @@ def _single_attempt(
 
     for student in order:
         student_group = _skill_group(student.skill_level)
-        candidates: list[tuple[float, int]] = []
+        candidates: list[tuple[float, int, int]] = []
         for table_idx in range(table_count):
             members = tables[table_idx]
             if len(members) >= target_sizes[table_idx]:
@@ -467,15 +586,36 @@ def _single_attempt(
             )
             same_group_count = table_skill_group_counts[table_idx][student_group]
             same_skill_count = table_skill_level_counts[table_idx][student.skill_level]
-            adjacent_skill_count = max(0, len(members) - same_skill_count)
-            # Same-skill is preferred; adjacent mixing is fallback when filling seats.
+            adjacent_skill_count = 0
+            far_skill_count = 0
+            soft_avoid_count = 0
+            for other in members:
+                other_skill = other.skill_level
+                if _is_soft_avoid_pair(student.skill_level, other_skill):
+                    soft_avoid_count += 1
+                dist = abs(
+                    _SKILL_PRIORITY.get(student.skill_level, 99)
+                    - _SKILL_PRIORITY.get(other_skill, 99)
+                )
+                if dist == 1:
+                    adjacent_skill_count += 1
+                elif dist >= 2:
+                    far_skill_count += 1
+
+            # Same-skill is best. Adjacent (高-中 / 中-やや低 / やや低-低) is next best.
+            # Far pairs, especially 中×低, are strongly discouraged.
             skill_penalty = (
-                2.4 * adjacent_skill_count
-                - 0.9 * same_skill_count
-                - 0.4 * same_group_count
+                0.8 * adjacent_skill_count
+                + 7.5 * far_skill_count
+                + 12.0 * soft_avoid_count
+                - 1.2 * same_skill_count
+                - 0.45 * same_group_count
             ) * config.skill_weight
             if adjacent_skill_count > 0:
-                skill_penalty += (adjacent_skill_count**2) * 0.25 * config.skill_weight
+                skill_penalty += (adjacent_skill_count**2) * 0.10 * config.skill_weight
+            if far_skill_count > 0:
+                skill_penalty += (far_skill_count**2) * 0.80 * config.skill_weight
+
             target_size = target_sizes[table_idx]
             before_size = abs(len(members) - target_size)
             after_size = abs(len(members) + 1 - target_size)
@@ -483,15 +623,19 @@ def _single_attempt(
 
             jitter = rng.random() * config.randomness_weight
             score = company_penalty + previous_penalty + skill_penalty + size_penalty + jitter
-            candidates.append((score, table_idx))
+            candidates.append((score, table_idx, soft_avoid_count))
 
         if not candidates:
             return [], math.inf
 
+        min_soft_avoid = min(c[2] for c in candidates)
+        if min_soft_avoid == 0:
+            candidates = [c for c in candidates if c[2] == 0]
+
         candidates.sort(key=lambda x: x[0])
         top_k = candidates[: min(3, len(candidates))]
         ranked_weights = [1.0 / (i + 1) for i in range(len(top_k))]
-        _, chosen_table = rng.choices(top_k, weights=ranked_weights, k=1)[0]
+        _, chosen_table, _ = rng.choices(top_k, weights=ranked_weights, k=1)[0]
 
         tables[chosen_table].append(student)
         table_company_counts[chosen_table][student.company] += 1
@@ -585,6 +729,7 @@ def generate_best_assignment(
         best_rows = _capacity_fill_rows(students, config, random.Random(base_rng.randint(1, 10**9)))
         used_mode = "hard_constraint_fallback"
 
+    best_rows = _optimize_soft_avoid_pairs(best_rows, config.table_count)
     best_rows = _renumber_tables_by_skill_priority(best_rows, config.table_count)
     final_score, metrics = _evaluate_assignment(best_rows, previous_pairs, previous_table_map, config)
     metrics["assignment_mode"] = used_mode
@@ -637,7 +782,7 @@ def validate_manual_rows(
         table_str = ", ".join(str(no) for no in sorted(skill_conflict_tables))
         errors.append(
             "スキル制約に違反する同席があります。"
-            f"（高い×低い / 高い×ヤバい） テーブル: {table_str}"
+            f"（高×やや低 / 高×低） テーブル: {table_str}"
         )
     return errors
 

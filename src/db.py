@@ -20,6 +20,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS students (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                name_kana TEXT NOT NULL DEFAULT '',
                 company TEXT NOT NULL,
                 skill_level TEXT NOT NULL CHECK (skill_level IN ('高い', '並', '低い', 'ヤバい')),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -53,3 +54,10 @@ def init_db() -> None:
             """
         )
 
+        # Lightweight migration for existing DBs.
+        student_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(students)").fetchall()
+        }
+        if "name_kana" not in student_columns:
+            conn.execute("ALTER TABLE students ADD COLUMN name_kana TEXT NOT NULL DEFAULT ''")
