@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -40,6 +41,134 @@ class SeatingConfig:
     size_weight: float = DEFAULT_WEIGHTS["size"]
     randomness_weight: float = DEFAULT_WEIGHTS["randomness"]
     seed: int | None = None
+
+
+def _normalize_identity_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    compact = normalized.strip().replace("　", " ").replace(" ", "")
+    return compact.lower()
+
+
+def _normalize_company_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    compact = normalized.strip().replace("　", " ").replace(" ", "")
+    compact = compact.replace("株式会社", "(株)").replace("有限会社", "(有)")
+    return compact.lower()
+
+
+def _student_identity_key(student: Student) -> tuple[str, str]:
+    return (
+        _normalize_identity_text(student.name),
+        _normalize_identity_text(student.company),
+    )
+
+
+def _row_identity_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _normalize_identity_text(str(row.get("name", ""))),
+        _normalize_identity_text(str(row.get("company", ""))),
+    )
+
+
+def _prefer_duplicate_candidate(existing: Student, candidate: Student) -> bool:
+    existing_has_kana = bool(existing.name_kana.strip())
+    candidate_has_kana = bool(candidate.name_kana.strip())
+    if candidate_has_kana != existing_has_kana:
+        return candidate_has_kana
+    return int(candidate.id) > int(existing.id)
+
+
+def _dedupe_students_for_assignment(students: list[Student]) -> list[Student]:
+    if not students:
+        return []
+
+    # Step 1: student_id の重複を除去（補足情報が多い行を優先）
+    by_id: dict[int, Student] = {}
+    id_order: list[int] = []
+    for student in students:
+        student_id = int(student.id)
+        if student_id not in by_id:
+            by_id[student_id] = student
+            id_order.append(student_id)
+            continue
+        if _prefer_duplicate_candidate(by_id[student_id], student):
+            by_id[student_id] = student
+    unique_by_id = [by_id[student_id] for student_id in id_order]
+
+    # Step 2: 同一受講生（氏名+会社）の重複を除去
+    by_identity: dict[tuple[str, str], Student] = {}
+    identity_order: list[tuple[str, str]] = []
+    for student in unique_by_id:
+        identity_key = _student_identity_key(student)
+        if identity_key not in by_identity:
+            by_identity[identity_key] = student
+            identity_order.append(identity_key)
+            continue
+        if _prefer_duplicate_candidate(by_identity[identity_key], student):
+            by_identity[identity_key] = student
+    return [by_identity[key] for key in identity_order]
+
+
+def _find_duplicate_student_ids(rows: list[dict[str, Any]]) -> list[int]:
+    counter: Counter[int] = Counter()
+    for row in rows:
+        try:
+            student_id = int(row.get("student_id", 0))
+        except (TypeError, ValueError):
+            student_id = 0
+        if student_id > 0:
+            counter[student_id] += 1
+    return sorted(student_id for student_id, count in counter.items() if count > 1)
+
+
+def _find_duplicate_row_identities(rows: list[dict[str, Any]]) -> list[str]:
+    counter: Counter[tuple[str, str]] = Counter()
+    display: dict[tuple[str, str], tuple[str, str]] = {}
+    for row in rows:
+        identity_key = _row_identity_key(row)
+        counter[identity_key] += 1
+        if identity_key not in display:
+            display[identity_key] = (
+                str(row.get("name", "")).strip(),
+                str(row.get("company", "")).strip(),
+            )
+
+    duplicates: list[str] = []
+    for identity_key, count in counter.items():
+        if count <= 1:
+            continue
+        name, company = display.get(identity_key, ("", ""))
+        duplicates.append(f"{name} ({company}) x{count}")
+    duplicates.sort()
+    return duplicates
+
+
+def _validate_no_duplicate_assignment_rows(
+    rows: list[dict[str, Any]], expected_total: int | None = None
+) -> None:
+    duplicate_ids = _find_duplicate_student_ids(rows)
+    if duplicate_ids:
+        preview = ", ".join(str(student_id) for student_id in duplicate_ids[:10])
+        suffix = " ..." if len(duplicate_ids) > 10 else ""
+        raise RuntimeError(
+            "配席結果に同一受講生IDの重複があります。"
+            f" student_id={preview}{suffix}"
+        )
+
+    duplicate_identities = _find_duplicate_row_identities(rows)
+    if duplicate_identities:
+        preview = " / ".join(duplicate_identities[:6])
+        suffix = " ..." if len(duplicate_identities) > 6 else ""
+        raise RuntimeError(
+            "配席結果に同一受講生（氏名+会社）の重複があります。"
+            f" {preview}{suffix}"
+        )
+
+    if expected_total is not None and len(rows) != expected_total:
+        raise RuntimeError(
+            "配席結果の人数が不整合です。"
+            f" expected={expected_total}, actual={len(rows)}"
+        )
 
 
 def _pair_key(a: int, b: int) -> tuple[int, int]:
@@ -156,6 +285,7 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
     # Hard-skill-constraint fallback:
     # keep forbidden pairs out while trying to fill all seats.
     tables: list[list[Student]] = [[] for _ in range(config.table_count)]
+    table_company_counts: list[defaultdict[str, int]] = [defaultdict(int) for _ in range(config.table_count)]
     remaining = students[:]
     rng.shuffle(remaining)
 
@@ -165,7 +295,8 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
         best_candidates: list[tuple[int, int]] = []
 
         for idx, student in enumerate(remaining):
-            candidate_tables: list[tuple[int, int]] = []
+            student_company_key = _normalize_company_key(student.company)
+            candidate_tables: list[tuple[int, int, int]] = []
             for table_idx, members in enumerate(tables):
                 if len(members) >= target_sizes[table_idx]:
                     continue
@@ -174,7 +305,8 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
                 soft_avoid_count = sum(
                     1 for m in members if _is_soft_avoid_pair(student.skill_level, m.skill_level)
                 )
-                candidate_tables.append((table_idx, soft_avoid_count))
+                same_company_count = table_company_counts[table_idx][student_company_key]
+                candidate_tables.append((table_idx, soft_avoid_count, same_company_count))
 
             if best_idx is None or len(candidate_tables) < len(best_candidates):
                 best_idx = idx
@@ -188,9 +320,14 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
             )
 
         student = remaining.pop(best_idx)
-        # Prefer tables with no 中×低 conflicts, then larger remaining capacity.
-        min_soft_conflict = min(soft for _, soft in best_candidates)
+        student_company_key = _normalize_company_key(student.company)
+        # Prefer no 中×低 conflicts, then fewer same-company members, then larger remaining capacity.
+        min_soft_conflict = min(soft for _, soft, _ in best_candidates)
         filtered_candidates = [item for item in best_candidates if item[1] == min_soft_conflict]
+        min_same_company = min(same_company for _, _, same_company in filtered_candidates)
+        filtered_candidates = [
+            item for item in filtered_candidates if item[2] == min_same_company
+        ]
         filtered_candidates.sort(
             key=lambda t: (
                 -(target_sizes[t[0]] - len(tables[t[0]])),
@@ -200,6 +337,7 @@ def _capacity_fill_rows(students: list[Student], config: SeatingConfig, rng: ran
         )
         chosen_table = filtered_candidates[0][0]
         tables[chosen_table].append(student)
+        table_company_counts[chosen_table][student_company_key] += 1
     return _students_to_rows(tables)
 
 
@@ -282,6 +420,23 @@ def _soft_avoid_pair_total(rows: list[dict[str, Any]], table_count: int) -> int:
     return sum(_soft_conflict_pairs_from_skills(skills) for skills in grouped_skills.values())
 
 
+def _company_collision_count_from_companies(companies: list[str]) -> int:
+    normalized_counter = Counter(_normalize_company_key(company) for company in companies if company)
+    return sum(count - 1 for count in normalized_counter.values() if count > 1)
+
+
+def _company_collision_total(rows: list[dict[str, Any]], table_count: int) -> int:
+    grouped_companies: dict[int, list[str]] = {table_no: [] for table_no in range(1, table_count + 1)}
+    for row in rows:
+        table_no = int(row["table_no"])
+        if table_no in grouped_companies:
+            grouped_companies[table_no].append(str(row.get("company", "")).strip())
+    return sum(
+        _company_collision_count_from_companies(companies)
+        for companies in grouped_companies.values()
+    )
+
+
 def _has_hard_conflict_in_skills(skills: list[str]) -> bool:
     for i in range(len(skills)):
         for j in range(i + 1, len(skills)):
@@ -360,6 +515,98 @@ def _optimize_soft_avoid_pairs(rows: list[dict[str, Any]], table_count: int) -> 
     return optimized
 
 
+def _optimize_company_collisions(rows: list[dict[str, Any]], table_count: int) -> list[dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {table_no: [] for table_no in range(1, table_count + 1)}
+    working_rows = [dict(row) for row in rows]
+    for row in working_rows:
+        grouped[int(row["table_no"])].append(row)
+
+    max_passes = 500
+    for _ in range(max_passes):
+        improved = False
+        for left_table in range(1, table_count + 1):
+            left_members = grouped[left_table]
+            if not left_members:
+                continue
+            left_skills = [str(m["skill_level"]) for m in left_members]
+            left_companies = [str(m.get("company", "")).strip() for m in left_members]
+
+            for right_table in range(left_table + 1, table_count + 1):
+                right_members = grouped[right_table]
+                if not right_members:
+                    continue
+                right_skills = [str(m["skill_level"]) for m in right_members]
+                right_companies = [str(m.get("company", "")).strip() for m in right_members]
+
+                before_company_total = (
+                    _company_collision_count_from_companies(left_companies)
+                    + _company_collision_count_from_companies(right_companies)
+                )
+                before_soft_total = (
+                    _soft_conflict_pairs_from_skills(left_skills)
+                    + _soft_conflict_pairs_from_skills(right_skills)
+                )
+
+                for li, left_student in enumerate(left_members):
+                    left_skill = str(left_student["skill_level"])
+                    left_company = str(left_student.get("company", "")).strip()
+                    left_company_key = _normalize_company_key(left_company)
+                    for ri, right_student in enumerate(right_members):
+                        right_skill = str(right_student["skill_level"])
+                        right_company = str(right_student.get("company", "")).strip()
+                        right_company_key = _normalize_company_key(right_company)
+                        if left_company_key == right_company_key:
+                            continue
+
+                        next_left_skills = left_skills[:]
+                        next_right_skills = right_skills[:]
+                        next_left_skills[li] = right_skill
+                        next_right_skills[ri] = left_skill
+                        if _has_hard_conflict_in_skills(next_left_skills):
+                            continue
+                        if _has_hard_conflict_in_skills(next_right_skills):
+                            continue
+
+                        next_left_companies = left_companies[:]
+                        next_right_companies = right_companies[:]
+                        next_left_companies[li] = right_company
+                        next_right_companies[ri] = left_company
+
+                        after_company_total = (
+                            _company_collision_count_from_companies(next_left_companies)
+                            + _company_collision_count_from_companies(next_right_companies)
+                        )
+                        if after_company_total >= before_company_total:
+                            continue
+
+                        after_soft_total = (
+                            _soft_conflict_pairs_from_skills(next_left_skills)
+                            + _soft_conflict_pairs_from_skills(next_right_skills)
+                        )
+                        if after_soft_total > before_soft_total + 2:
+                            continue
+
+                        left_members[li], right_members[ri] = right_student, left_student
+                        left_members[li]["table_no"] = left_table
+                        right_members[ri]["table_no"] = right_table
+                        improved = True
+                        break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    optimized: list[dict[str, Any]] = []
+    for table_no in range(1, table_count + 1):
+        optimized.extend(grouped[table_no])
+    optimized.sort(key=lambda r: (int(r["table_no"]), int(r["student_id"])))
+    return optimized
+
+
 def optimize_soft_skill_conflicts(rows: list[dict[str, Any]], table_count: int) -> list[dict[str, Any]]:
     return _optimize_soft_avoid_pairs(rows, table_count)
 
@@ -401,11 +648,21 @@ def _evaluate_assignment(
 
     for table_no in range(1, config.table_count + 1):
         members = table_members[table_no]
-        company_counter = Counter(m["company"] for m in members)
+        company_counter = Counter(
+            _normalize_company_key(str(m.get("company", ""))) for m in members
+        )
+        company_display_by_key: dict[str, str] = {}
+        for member in members:
+            raw_company = str(member.get("company", "")).strip()
+            key = _normalize_company_key(raw_company)
+            if key and key not in company_display_by_key:
+                company_display_by_key[key] = raw_company
         skill_counter = Counter(m["skill_level"] for m in members)
         skill_group_counter = Counter(_skill_group(str(m["skill_level"])) for m in members)
         duplicate_companies = {
-            company: count for company, count in company_counter.items() if count > 1
+            company_display_by_key.get(company_key, company_key): count
+            for company_key, count in company_counter.items()
+            if count > 1
         }
         company_collisions = sum(count - 1 for count in company_counter.values() if count > 1)
         company_collision_total += company_collisions
@@ -529,7 +786,7 @@ def _single_attempt(
 
     skill_group_counts = Counter(_skill_group(s.skill_level) for s in students)
     skill_counts = Counter(s.skill_level for s in students)
-    company_counts = Counter(s.company for s in students)
+    company_counts = Counter(_normalize_company_key(s.company) for s in students)
 
     order = students[:]
     rng.shuffle(order)
@@ -538,7 +795,7 @@ def _single_attempt(
             _SKILL_PRIORITY.get(s.skill_level, len(_SKILL_PRIORITY)),  # 高 -> 中 -> やや低 -> 低
             skill_group_counts.get(_skill_group(s.skill_level), 0),  # レアなグループを先に置く
             skill_counts.get(s.skill_level, 0),  # 同グループ内のレア度
-            -company_counts.get(s.company, 0),  # 人数が多い会社を先に分散
+            -company_counts.get(_normalize_company_key(s.company), 0),  # 人数が多い会社を先に分散
             rng.random(),
         )
     )
@@ -546,6 +803,7 @@ def _single_attempt(
 
     for student in order:
         student_group = _skill_group(student.skill_level)
+        student_company_key = _normalize_company_key(student.company)
         candidates: list[tuple[float, int, int]] = []
         for table_idx in range(table_count):
             members = tables[table_idx]
@@ -571,7 +829,10 @@ def _single_attempt(
                 ):
                     continue
 
-            company_penalty = table_company_counts[table_idx][student.company] * config.company_weight
+            same_company_count = table_company_counts[table_idx][student_company_key]
+            company_penalty = (
+                ((same_company_count + 1) ** 2 - 1) * config.company_weight
+            )
 
             prev_hits = 0
             for other in members:
@@ -633,12 +894,10 @@ def _single_attempt(
             candidates = [c for c in candidates if c[2] == 0]
 
         candidates.sort(key=lambda x: x[0])
-        top_k = candidates[: min(3, len(candidates))]
-        ranked_weights = [1.0 / (i + 1) for i in range(len(top_k))]
-        _, chosen_table, _ = rng.choices(top_k, weights=ranked_weights, k=1)[0]
+        _, chosen_table, _ = candidates[0]
 
         tables[chosen_table].append(student)
-        table_company_counts[chosen_table][student.company] += 1
+        table_company_counts[chosen_table][student_company_key] += 1
         table_skill_group_counts[chosen_table][student_group] += 1
         table_skill_level_counts[chosen_table][student.skill_level] += 1
         remaining_skill_counts[student.skill_level] -= 1
@@ -656,6 +915,8 @@ def generate_best_assignment(
     previous_table_map: dict[int, int],
     config: SeatingConfig,
 ) -> dict[str, Any]:
+    students = _dedupe_students_for_assignment(students)
+
     if config.min_per_table > config.max_per_table:
         raise ValueError(
             f"最小人数と最大人数の設定が不正です。min={config.min_per_table}, max={config.max_per_table}"
@@ -729,8 +990,11 @@ def generate_best_assignment(
         best_rows = _capacity_fill_rows(students, config, random.Random(base_rng.randint(1, 10**9)))
         used_mode = "hard_constraint_fallback"
 
+    best_rows = _optimize_company_collisions(best_rows, config.table_count)
     best_rows = _optimize_soft_avoid_pairs(best_rows, config.table_count)
+    best_rows = _optimize_company_collisions(best_rows, config.table_count)
     best_rows = _renumber_tables_by_skill_priority(best_rows, config.table_count)
+    _validate_no_duplicate_assignment_rows(best_rows, expected_total=len(students))
     final_score, metrics = _evaluate_assignment(best_rows, previous_pairs, previous_table_map, config)
     metrics["assignment_mode"] = used_mode
     metrics["fallback_used"] = used_mode != "strict"
@@ -743,6 +1007,24 @@ def validate_manual_rows(
     errors: list[str] = []
     if any(int(row["table_no"]) < 1 or int(row["table_no"]) > table_count for row in rows):
         errors.append(f"table_no は 1〜{table_count} の範囲で入力してください。")
+
+    duplicate_ids = _find_duplicate_student_ids(rows)
+    if duplicate_ids:
+        preview = ", ".join(str(student_id) for student_id in duplicate_ids[:10])
+        suffix = " ..." if len(duplicate_ids) > 10 else ""
+        errors.append(
+            "同じ受講生IDが複数テーブルに重複配置されています。"
+            f" student_id={preview}{suffix}"
+        )
+
+    duplicate_identities = _find_duplicate_row_identities(rows)
+    if duplicate_identities:
+        preview = " / ".join(duplicate_identities[:6])
+        suffix = " ..." if len(duplicate_identities) > 6 else ""
+        errors.append(
+            "同一受講生（氏名+会社）の重複配置があります。"
+            f" {preview}{suffix}"
+        )
 
     table_sizes = Counter(int(row["table_no"]) for row in rows)
     under_min = [table_no for table_no in range(1, table_count + 1) if table_sizes.get(table_no, 0) < min_per_table]

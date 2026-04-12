@@ -44,6 +44,8 @@ def main() -> None:
 
     rows = result["rows"]
     assert len(rows) == 73, "全員が配置されていません"
+    id_counts = Counter(int(row["student_id"]) for row in rows)
+    assert all(count == 1 for count in id_counts.values()), "受講生IDの重複配置があります"
     table_sizes = Counter(row["table_no"] for row in rows)
     assert all(size <= DEFAULT_MAX_PER_TABLE for size in table_sizes.values()), "6名超過あり"
     print("smoke test passed")

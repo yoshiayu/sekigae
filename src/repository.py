@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections import defaultdict
 from typing import Any
 
@@ -21,6 +22,19 @@ def _reset_autoincrement(conn: Any, table_names: list[str]) -> None:
 
 def _normalize_student_name(value: str) -> str:
     return " ".join(value.strip().replace("　", " ").split())
+
+
+def _normalize_student_identity_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    compact = normalized.strip().replace("　", " ").replace(" ", "")
+    return compact.lower()
+
+
+def _student_identity_key(name: str, company: str) -> tuple[str, str]:
+    return (
+        _normalize_student_identity_text(name),
+        _normalize_student_identity_text(company),
+    )
 
 
 def list_students(search: str = "") -> list[dict[str, Any]]:
@@ -105,9 +119,11 @@ def bulk_insert_students(rows: list[dict[str, str]]) -> int:
         existing_rows = conn.execute(
             "SELECT id, name, company, name_kana FROM students"
         ).fetchall()
-        existing_by_key = {
-            (str(row["name"]), str(row["company"])): row for row in existing_rows
-        }
+        existing_by_key: dict[tuple[str, str], Any] = {}
+        for row in existing_rows:
+            key = _student_identity_key(str(row["name"]), str(row["company"]))
+            if key not in existing_by_key:
+                existing_by_key[key] = row
         existing_keys = set(existing_by_key.keys())
         seen_keys = set(existing_keys)
 
@@ -117,7 +133,7 @@ def bulk_insert_students(rows: list[dict[str, str]]) -> int:
             name = row["name"].strip()
             name_kana = row.get("name_kana", "").strip()
             company = row["company"].strip()
-            key = (name, company)
+            key = _student_identity_key(name, company)
             if key in existing_by_key:
                 existing = existing_by_key[key]
                 existing_kana = str(existing["name_kana"] or "").strip()

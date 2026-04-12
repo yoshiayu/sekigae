@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -283,6 +284,127 @@ def _normalize_name_text(value: str) -> str:
     return " ".join(value.strip().replace("　", " ").split())
 
 
+def _normalize_identity_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    compact = normalized.strip().replace("　", " ").replace(" ", "")
+    return compact.lower()
+
+
+def _student_identity_key_from_row(row: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _normalize_identity_text(str(row.get("name", ""))),
+        _normalize_identity_text(str(row.get("company", ""))),
+    )
+
+
+def _find_duplicate_student_groups(rows: list[dict[str, Any]]) -> list[tuple[str, str, int]]:
+    key_to_display: dict[tuple[str, str], tuple[str, str]] = {}
+    key_counter: Counter[tuple[str, str]] = Counter()
+
+    for row in rows:
+        key = _student_identity_key_from_row(row)
+        key_counter[key] += 1
+        if key not in key_to_display:
+            key_to_display[key] = (
+                str(row.get("name", "")).strip(),
+                str(row.get("company", "")).strip(),
+            )
+
+    duplicates: list[tuple[str, str, int]] = []
+    for key, count in key_counter.items():
+        if count <= 1:
+            continue
+        display_name, display_company = key_to_display.get(key, ("", ""))
+        duplicates.append((display_name, display_company, int(count)))
+    duplicates.sort(key=lambda item: (-item[2], item[0], item[1]))
+    return duplicates
+
+
+def _dedupe_students_for_seating(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, int]]]:
+    duplicate_groups = _find_duplicate_student_groups(rows)
+    if not duplicate_groups:
+        return rows[:], []
+
+    deduped_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    ordered_keys: list[tuple[str, str]] = []
+    for row in rows:
+        key = _student_identity_key_from_row(row)
+        if key not in deduped_by_key:
+            deduped_by_key[key] = dict(row)
+            ordered_keys.append(key)
+            continue
+
+        existing = deduped_by_key[key]
+        existing_kana = str(existing.get("name_kana", "")).strip()
+        new_kana = str(row.get("name_kana", "")).strip()
+        try:
+            existing_id = int(existing.get("id", 0))
+        except (TypeError, ValueError):
+            existing_id = 0
+        try:
+            new_id = int(row.get("id", 0))
+        except (TypeError, ValueError):
+            new_id = 0
+
+        if (not existing_kana and new_kana) or (bool(new_kana) == bool(existing_kana) and new_id > existing_id):
+            deduped_by_key[key] = dict(row)
+
+    deduped_rows = [deduped_by_key[key] for key in ordered_keys]
+    return deduped_rows, duplicate_groups
+
+
+def _validate_no_duplicate_assignment_rows(rows: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    student_id_counter: Counter[int] = Counter()
+    identity_counter: Counter[tuple[str, str]] = Counter()
+    identity_display: dict[tuple[str, str], tuple[str, str]] = {}
+
+    for row in rows:
+        try:
+            student_id = int(row.get("student_id", 0))
+        except (TypeError, ValueError):
+            student_id = 0
+        if student_id > 0:
+            student_id_counter[student_id] += 1
+
+        identity_key = _student_identity_key_from_row(row)
+        identity_counter[identity_key] += 1
+        if identity_key not in identity_display:
+            identity_display[identity_key] = (
+                str(row.get("name", "")).strip(),
+                str(row.get("company", "")).strip(),
+            )
+
+    duplicate_ids = sorted(
+        student_id for student_id, count in student_id_counter.items() if count > 1
+    )
+    if duplicate_ids:
+        preview = ", ".join(str(student_id) for student_id in duplicate_ids[:10])
+        suffix = " ..." if len(duplicate_ids) > 10 else ""
+        errors.append(
+            "同じ受講生IDが複数回配置されています。"
+            f" student_id={preview}{suffix}"
+        )
+
+    duplicate_identities: list[str] = []
+    for key, count in identity_counter.items():
+        if count <= 1:
+            continue
+        name, company = identity_display.get(key, ("", ""))
+        duplicate_identities.append(f"{name} ({company}) x{count}")
+    if duplicate_identities:
+        preview = " / ".join(duplicate_identities[:6])
+        suffix = " ..." if len(duplicate_identities) > 6 else ""
+        errors.append(
+            "同一受講生（氏名+会社）の重複配置があります。"
+            f" {preview}{suffix}"
+        )
+
+    return errors
+
+
 def _normalize_skill_input(value: str) -> str | None:
     raw = value.strip()
     if raw in SKILL_LEVELS:
@@ -424,12 +546,24 @@ with tab_students:
     search = st.text_input("検索（氏名 / 会社名）", value="", key="student_search")
     students = list_students(search=search)
     all_students = list_students()
+    duplicate_groups = _find_duplicate_student_groups(all_students)
     distribution = Counter(row["skill_level"] for row in all_students)
 
     left, right = st.columns([2, 1])
     with left:
         st.write(f"登録人数: **{len(all_students)}名**")
         st.write(_skill_distribution_text(distribution))
+        if duplicate_groups:
+            duplicate_total = sum(count - 1 for _, _, count in duplicate_groups)
+            preview = " / ".join(
+                f"{name} ({company}) x{count}" for name, company, count in duplicate_groups[:6]
+            )
+            suffix = " ..." if len(duplicate_groups) > 6 else ""
+            st.warning(
+                f"同一受講生（氏名+会社）の重複登録が {duplicate_total} 件あります。"
+                "席替え実行時は重複分を自動除外します。"
+            )
+            st.caption(f"重複例: {preview}{suffix}")
     with right:
         if st.button("ダミー73名を全置換で投入", key="load_dummy_students"):
             parsed_rows, errs = _load_dummy_csv()
@@ -646,7 +780,8 @@ with tab_students:
 
 with tab_run:
     st.subheader("席替え実行")
-    students_rows = list_students()
+    all_students_rows = list_students()
+    students_rows, run_duplicate_groups = _dedupe_students_for_seating(all_students_rows)
     student_count = len(students_rows)
     distribution = Counter(row["skill_level"] for row in students_rows)
     col_table, col_min, col_max = st.columns(3)
@@ -698,6 +833,17 @@ with tab_run:
     else:
         col_info4.metric("空席", f"{capacity - student_count}席")
     st.write(_skill_distribution_text(distribution))
+    if run_duplicate_groups:
+        removed_count = len(all_students_rows) - len(students_rows)
+        preview = " / ".join(
+            f"{name} ({company}) x{count}" for name, company, count in run_duplicate_groups[:6]
+        )
+        suffix = " ..." if len(run_duplicate_groups) > 6 else ""
+        st.warning(
+            "同一受講生（氏名+会社）の重複登録を検出したため、"
+            f"席替え計算から {removed_count} 名を自動除外しました。"
+        )
+        st.caption(f"除外対象の例: {preview}{suffix}")
 
     if student_count < min_required:
         st.error(
@@ -773,22 +919,31 @@ with tab_run:
                 st.error(str(exc))
                 result = None
             if result is not None:
-                run_layout_rows = _coerce_layout_rows(
-                    st.session_state.get("current_layout_rows"),
-                    config.table_count,
-                )
-                _store_result(
-                    rows=result["rows"],
-                    score=float(result["score"]),
-                    metrics=result["metrics"],
-                    config=config,
-                    target_week=target_week,
-                    table_layout_rows=run_layout_rows,
-                    previous_history_id=previous_history_id,
-                    previous_pairs=previous_pairs,
-                    previous_table_map=previous_table_map,
-                )
-                st.success("席替えを生成しました。結果タブで確認できます。")
+                duplicate_errors = _validate_no_duplicate_assignment_rows(result["rows"])
+                if duplicate_errors:
+                    for err in duplicate_errors:
+                        st.error(err)
+                    st.error(
+                        "重複のない配席結果を生成できませんでした。"
+                        " もう一度席替えを実行してください。"
+                    )
+                else:
+                    run_layout_rows = _coerce_layout_rows(
+                        st.session_state.get("current_layout_rows"),
+                        config.table_count,
+                    )
+                    _store_result(
+                        rows=result["rows"],
+                        score=float(result["score"]),
+                        metrics=result["metrics"],
+                        config=config,
+                        target_week=target_week,
+                        table_layout_rows=run_layout_rows,
+                        previous_history_id=previous_history_id,
+                        previous_pairs=previous_pairs,
+                        previous_table_map=previous_table_map,
+                    )
+                    st.success("席替えを生成しました。結果タブで確認できます。")
 
 
 with tab_result:
@@ -803,6 +958,15 @@ with tab_result:
         current_metrics = st.session_state.get("current_metrics", {})
         current_score = float(st.session_state.get("current_score", 0.0))
         current_target_week = st.session_state.get("current_target_week", _current_iso_week())
+        duplicate_assignment_errors = _validate_no_duplicate_assignment_rows(current_rows)
+        has_duplicate_assignments = bool(duplicate_assignment_errors)
+        if has_duplicate_assignments:
+            for err in duplicate_assignment_errors:
+                st.error(err)
+            st.warning(
+                "重複があるため、この結果のCSV/Excel/Google出力と履歴保存は無効化しています。"
+                "「席替え実行」タブで再実行してください。"
+            )
 
         metric_cols = st.columns(4)
         metric_cols[0].metric("総合スコア", f"{current_score:.1f}")
@@ -1030,6 +1194,7 @@ with tab_result:
             data=csv_bytes,
             file_name=f"seating_result_{current_target_week}.csv",
             mime="text/csv",
+            disabled=has_duplicate_assignments,
             key="download_current_result_csv",
         )
 
@@ -1068,6 +1233,7 @@ with tab_result:
                 str(layout_payload_excel["normal_name"]), suffix=".xlsx"
             ),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=has_duplicate_assignments,
             key="download_current_result_xlsx",
         )
         st.caption(
@@ -1097,7 +1263,11 @@ with tab_result:
         st.caption(
             "サービスアカウントの `client_email` を対象スプレッドシートに編集者として共有してから実行してください。"
         )
-        if st.button("Googleスプレッドシートへ2種類を作成", key="export_to_google_sheet"):
+        if st.button(
+            "Googleスプレッドシートへ2種類を作成",
+            key="export_to_google_sheet",
+            disabled=has_duplicate_assignments,
+        ):
             if service_account_file is None:
                 st.error("GoogleサービスアカウントJSONを指定してください。")
             else:
@@ -1132,7 +1302,12 @@ with tab_result:
                     )
 
         st.caption("印刷はブラウザ標準機能（Ctrl+P / Cmd+P）を利用してください。")
-        if st.button("この結果を履歴に保存", type="primary", key="save_current_history"):
+        if st.button(
+            "この結果を履歴に保存",
+            type="primary",
+            key="save_current_history",
+            disabled=has_duplicate_assignments,
+        ):
             settings = st.session_state.get("current_settings", {})
             history_id = create_seating_history(
                 target_week=str(current_target_week),

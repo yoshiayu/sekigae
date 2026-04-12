@@ -274,6 +274,10 @@ def publish_layouts_to_google_sheets(
         limit_cols=TEMPLATE_COLS,
         skip_special_labels=True,
     )
+    _overlay_seat_cells_exact(
+        base_matrix=normal_matrix,
+        grid=normal_grid_with_kana,
+    )
 
     update_range = f"A1:{_to_col_label(write_cols)}{TEMPLATE_ROWS}"
     ws_normal.update(range_name=update_range, values=normal_matrix)
@@ -544,6 +548,22 @@ def _overlay_non_empty_grid(
                     if any(keyword in normalized for keyword in _SPECIAL_LABEL_KEYWORDS):
                         continue
                 base_matrix[r_idx][c_idx] = value
+
+
+def _overlay_seat_cells_exact(base_matrix: list[list[str]], grid: list[list[str]]) -> None:
+    if not base_matrix or not grid:
+        return
+    for row_no, col_no in _SEAT_COORDS:
+        r_idx = row_no - 1
+        c_idx = col_no - 1
+        if r_idx < 0 or c_idx < 0:
+            continue
+        if r_idx >= len(base_matrix) or r_idx >= len(grid):
+            continue
+        if c_idx >= len(base_matrix[r_idx]) or c_idx >= len(grid[r_idx]):
+            continue
+        value = grid[r_idx][c_idx]
+        base_matrix[r_idx][c_idx] = "" if value is None else str(value)
 
 
 def _rotate_matrix_region_180(
