@@ -44,7 +44,118 @@ python -m streamlit run app.py --server.port 8502
 
 停止: 実行中ターミナルで `Ctrl + C`
 
-## 4. 画面構成
+## 4. 全体構成（Mermaid）
+
+このアプリは、別プロセスのAPIサーバーを立てず、Streamlitアプリ内でバックエンド処理を実行します。
+
+```mermaid
+flowchart LR
+  U["ユーザー<br/>Browser"] --> A["app.py<br/>Streamlit UI + Orchestrator"]
+  A --> CSV["src/csv_service.py<br/>CSV解析/出力"]
+  A --> SEAT["src/seating.py<br/>席替えアルゴリズム"]
+  A --> REPO["src/repository.py<br/>CRUD/履歴保存"]
+  REPO --> DB["src/db.py<br/>SQLite接続/初期化"]
+  DB --> SQL[("seating_app.db")]
+  A --> EXP["src/layout_export.py<br/>Excel/Google出力"]
+  EXP --> XLSX["openpyxl<br/>Excel生成"]
+  EXP --> GS["Google Sheets API<br/>(gspread)"]
+```
+
+## 5. バックエンド構成（ファイル責務）
+
+- `app.py`
+  - 画面描画、入力受付、処理呼び出し、セッション状態管理
+- `src/db.py`
+  - SQLite初期化とマイグレーション（`name_kana` 列追加を含む）
+- `src/repository.py`
+  - 受講生CRUD、履歴作成、履歴取得、一括更新
+- `src/seating.py`
+  - 配席ロジック、制約評価、スコアリング、最適化
+- `src/csv_service.py`
+  - CSV取り込み（ヘッダ揺れ吸収）、CSV出力
+- `src/layout_export.py`
+  - テンプレ座席表グリッド生成、Excel出力、Googleスプレッドシート出力
+
+## 6. データモデル（Mermaid ER）
+
+```mermaid
+erDiagram
+  students ||--o{ seating_assignments : "assigned"
+  seating_histories ||--o{ seating_assignments : "has"
+
+  students {
+    int id PK
+    string name
+    string name_kana
+    string company
+    string skill_level
+    datetime created_at
+    datetime updated_at
+  }
+
+  seating_histories {
+    int id PK
+    string target_week
+    string settings_json
+    float total_score
+    float overlap_rate
+    datetime created_at
+  }
+
+  seating_assignments {
+    int id PK
+    int seating_history_id FK
+    int student_id FK
+    int table_no
+  }
+```
+
+## 7. 処理フロー（Mermaid）
+
+### 7-1. 席替え実行フロー
+
+```mermaid
+sequenceDiagram
+  participant User as User
+  participant UI as app.py
+  participant Repo as repository.py
+  participant Algo as seating.py
+  participant DB as SQLite
+
+  User->>UI: 席替え条件を入力して実行
+  UI->>Repo: list_students()
+  Repo->>DB: SELECT students
+  DB-->>Repo: 受講生一覧
+  Repo-->>UI: rows
+  UI->>Algo: generate_best_assignment(...)
+  Algo-->>UI: rows + score + metrics
+  UI-->>User: 席替え結果を表示
+  User->>UI: この結果を履歴に保存
+  UI->>Repo: create_seating_history() / save_assignments()
+  Repo->>DB: INSERT histories/assignments
+```
+
+### 7-2. Googleスプレッドシート出力フロー
+
+```mermaid
+sequenceDiagram
+  participant User as User
+  participant UI as app.py
+  participant Export as layout_export.py
+  participant GS as Google Sheets API
+
+  User->>UI: Googleスプレッドシートへ2種類を作成
+  UI->>Export: build_layout_payload(...)
+  UI->>Export: publish_layouts_to_google_sheets(...)
+  Export->>GS: テンプレシート複製(受講生視点)
+  Export->>GS: 受講生視点シートへ値を書き込み
+  Export->>GS: 受講生視点シートを複製(講師視点)
+  Export->>GS: B5:T18 を180°反転(値/書式/結合/行高/列幅)
+  Export-->>UI: 作成シート名・URL
+  UI-->>User: 成功メッセージとリンク表示
+```
+
+## 8. 画面構成
 
 タブ構成:
 
@@ -53,7 +164,7 @@ python -m streamlit run app.py --server.port 8502
 - `席替え結果`
 - `履歴`
 
-### 4-1. 受講生管理
+### 8-1. 受講生管理
 
 主な機能:
 
@@ -75,16 +186,7 @@ CSV取り込み仕様:
 - 画面表示: `高`, `中`, `やや低`, `低`
 - 互換入力（CSV/一括更新）: `高い`, `並`, `低い`, `ヤバい` も受け付け
 
-スキル一括更新仕様:
-
-- 受講生名は変更せずスキルのみ更新
-- 入力形式:
-  - `受講生<TAB>スキル`（Excel 2列貼り付け）
-  - `受講生=スキル`
-  - `受講生:スキル`
-  - `受講生,スキル`
-
-### 4-2. 席替え実行
+### 8-2. 席替え実行
 
 設定項目:
 
@@ -111,7 +213,7 @@ CSV取り込み仕様:
 - 優先混在:
   - `高-中`, `中-やや低`, `やや低-低`
 
-### 4-3. 席替え結果
+### 8-3. 席替え結果
 
 主な機能:
 
@@ -149,7 +251,7 @@ CSV取り込み仕様:
   - 通常: `○月○日座席表（受講生視点）`
   - 反転: `○月○日座席表（講師視点）`
 
-### 4-4. 履歴
+### 8-4. 履歴
 
 主な機能:
 
@@ -157,7 +259,7 @@ CSV取り込み仕様:
 - 過去結果CSV出力
 - 過去結果を結果タブに再読込
 
-## 5. Googleスプレッドシート自動出力の準備
+## 9. Googleスプレッドシート自動出力の準備
 
 1. Google Cloudでサービスアカウントを作成
 2. JSONキーを発行してダウンロード
@@ -172,7 +274,7 @@ CSV取り込み仕様:
 
 - 指定テンプレート名が見つからない場合は `座席表（テンプレ）` やテンプレ相当シートへフォールバックします。
 
-## 6. トラブルシュート
+## 10. トラブルシュート
 
 - `streamlit` が見つからない
   - 仮想環境を有効化後、`python -m pip install -r requirements.txt`
@@ -183,7 +285,7 @@ CSV取り込み仕様:
   - `client_email` が対象シートの編集者か
   - テンプレートシート名が正しいか
 
-## 7. スモークテスト
+## 11. スモークテスト
 
 ```bash
 python scripts/smoke_test.py
